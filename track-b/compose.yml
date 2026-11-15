@@ -1,0 +1,68 @@
+# Track B: one Artemis server and its PostgreSQL database.
+#
+#   ARTEMIS_IMAGE=artemis-thesis:<commit> docker compose -p <project> -f compose.yml up -d --wait
+#
+# Every commit runs on the same PostgreSQL version (D36). The project name separates the volumes of parallel setups.
+
+services:
+    postgres:
+        image: docker.io/library/postgres:18.6-alpine@sha256:9ba53c7d41ea093baf5c1ba635ba5434c4f979880527d49bb7d9237d3193085b
+        command: ["postgres", "-c", "max_connections=500"]
+        environment:
+            POSTGRES_HOST_AUTH_METHOD: trust
+            POSTGRES_USER: Artemis
+            POSTGRES_DB: Artemis
+            PGDATA: /var/lib/postgresql/pgdata
+        volumes:
+            - postgres-data:/var/lib/postgresql
+        shm_size: 256m
+        healthcheck:
+            test: pg_isready -h 127.0.0.1 -U Artemis -d Artemis
+            interval: 2s
+            timeout: 3s
+            retries: 60
+
+    artemis:
+        image: ${ARTEMIS_IMAGE:?artemis-thesis:<commit>}
+        depends_on:
+            postgres:
+                condition: service_healthy
+        environment:
+            # The profiles of the Artemis migration check (deployment/docker/artemis/config/migration-check.env): no version
+            # control, no continuous integration, no external services. The quiz module needs none of them.
+            SPRING_PROFILES_ACTIVE: artemis,scheduling,core,prod,docker
+            SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/Artemis?sslmode=disable
+            SPRING_DATASOURCE_USERNAME: Artemis
+            SPRING_DATASOURCE_PASSWORD: ""
+            SPRING_LIQUIBASE_CONTEXTS: prod
+            JAVA_HEAP: ${JAVA_HEAP:--Xms4g -Xmx4g}
+            ARTEMIS_USERMANAGEMENT_USEEXTERNAL: "false"
+            ARTEMIS_USERMANAGEMENT_INTERNALADMIN_USERNAME: artemis_admin
+            # Not a value from the Artemis repository: from 9.9.3 on, Artemis refuses to start with a published example password.
+            ARTEMIS_USERMANAGEMENT_INTERNALADMIN_PASSWORD: thesis-track-b-local-admin
+            # Fewer bcrypt rounds make seeding thousands of users feasible; logins happen before the measurement (D13).
+            ARTEMIS_BCRYPTSALTROUNDS: "4"
+            ARTEMIS_TELEMETRY_ENABLED: "false"
+            # A fixed local secret: tokens stay valid across the server restarts of one setup. Not a deployment credential.
+            JHIPSTER_SECURITY_AUTHENTICATION_JWT_BASE64SECRET: dGhlc2lzLXRyYWNrLWItbG9jYWwtc2VjcmV0LW5vdC1hLWRlcGxveW1lbnQtY3JlZGVudGlhbC0wMTIzNDU2Nzg5
+            SERVER_URL: http://localhost:${ARTEMIS_PORT:-18080}
+            # Required by PropertiesConfigurationGuard; values as in migration-check.env.
+            INFO_OPERATORNAME: Thesis Benchmark
+            INFO_OPERATORADMINNAME: Thesis Benchmark
+            INFO_UNIVERSITYNAME: Thesis Benchmark
+            INFO_TESTSERVER: "true"
+            MANAGEMENT_METRICS_EXPORT_PROMETHEUS_ENABLED: "true"
+        ports:
+            - "127.0.0.1:${ARTEMIS_PORT:-18080}:8080"
+        volumes:
+            - artemis-data:/opt/artemis/data
+        healthcheck:
+            test: wget -q -t1 -T5 -O - http://localhost:8080/management/health/readiness | grep -xq '{"status":"UP"}' || exit 1
+            interval: 2s
+            timeout: 6s
+            retries: 3
+            start_period: 600s
+
+volumes:
+    postgres-data:
+    artemis-data:
