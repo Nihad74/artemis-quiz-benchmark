@@ -94,14 +94,15 @@ wait_for_evaluation() {
 }
 
 # sample <image> <run-folder>: every SAMPLE_SECONDS (measured from the start of each sample) until <run-folder>/.stop
-# exists. A sample takes about 2.5 s (docker stats waits for a second reading).
+# exists. A sample takes about 2.5 s (docker stats waits for a second reading). The containers are looked up at every
+# sample, so that the k6 container (k6.sh names it <project>-k6) is included while it runs.
 sample() {
-    local image="$1" dir="$2" containers
+    local image="$1" dir="$2"
     # A failed sample must not end the sampling.
     set +e
-    containers="$(compose "$image" ps -q artemis postgres | tr '\n' ' ')"
     while [[ ! -e "$dir/.stop" ]]; do
-        local time="$EPOCHREALTIME" stats activity
+        local time="$EPOCHREALTIME" containers stats activity
+        containers="$(docker ps -q --filter "name=^${project}-" | tr '\n' ' ')"
         # shellcheck disable=SC2086
         stats="$(docker stats --no-stream --format '{{json .}}' $containers | jq -sc .)"
         activity="$(psql_at "$image" "select count(*) filter (where wait_event_type = 'Lock'), count(*) filter (where state = 'active') from pg_stat_activity where datname = 'Artemis' and pid <> pg_backend_pid()")"

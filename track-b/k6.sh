@@ -23,7 +23,8 @@ docker run --rm "$image" version >"$run/k6.txt"
 echo "image $image cpuset $K6_CPUSET memory $K6_MEMORY" >>"$run/k6.txt"
 
 # Every VU keeps its own connection; 2000 VUs need more than the default 1024 file descriptors.
-exec docker run --rm \
+# The container name lets run.sh sample it next to the server (D36 pilot: k6 must not be the bottleneck).
+exec docker run --rm --name "${project}-k6" \
     --network "${project}_default" \
     --cpuset-cpus "$K6_CPUSET" --memory "$K6_MEMORY" --memory-swap "$K6_MEMORY" \
     --ulimit nofile=65536:65536 \

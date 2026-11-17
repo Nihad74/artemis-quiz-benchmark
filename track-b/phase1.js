@@ -25,7 +25,7 @@ import { check, fail, sleep } from 'k6';
 import { SharedArray } from 'k6/data';
 import exec from 'k6/execution';
 import http from 'k6/http';
-import { Counter } from 'k6/metrics';
+import { Counter, Trend } from 'k6/metrics';
 import { submission } from './lib/answers.mjs';
 
 const SERVER = __ENV.SERVER;
@@ -60,6 +60,10 @@ if (config.duration * 1000 < OPEN_WINDOW_MS + SAVES * THINK_MS[1] + SUBMIT_BEFOR
 
 const submittedInTime = new Counter('phase1_submitted_in_time');
 const failedStudents = new Counter('phase1_failed_students');
+// k6 capacity (D36 pilot): how late a VU wakes up for a planned request, and how often the planned time had already passed
+// (then the server was slow, not k6).
+const scheduleLag = new Trend('phase1_schedule_lag', true);
+const behindSchedule = new Counter('phase1_behind_schedule');
 
 const TYPES = ['start-participation', 'save', 'submit'];
 export const options = {
@@ -83,6 +87,7 @@ export const options = {
         // Always-true thresholds make k6 keep these submetrics in the summary.
         ...Object.fromEntries(TYPES.map((type) => [`http_req_duration{type:${type}}`, ['max>=0']])),
         ...Object.fromEntries([1, 2, 3].map((save) => [`http_req_duration{type:save,save:${save}}`, ['max>=0']])),
+        ...Object.fromEntries(['open', 'submit'].map((step) => [`phase1_schedule_lag{step:${step}}`, ['max>=0']])),
     },
 };
 
@@ -102,10 +107,14 @@ function useSession(session) {
     }
 }
 
-function sleepUntil(time) {
+/** Sleeps until `time` and records how late the VU woke up; if `time` has passed already, counts that instead. */
+function sleepUntil(time, step) {
     const wait = time - Date.now();
     if (wait > 0) {
         sleep(wait / 1000);
+        scheduleLag.add(Date.now() - time, { step });
+    } else {
+        behindSchedule.add(1, { step });
     }
 }
 
@@ -153,7 +162,7 @@ export default function (run) {
     const submitAt = run.due - between(SUBMIT_BEFORE_DUE_MS);
     useSession(student);
 
-    sleepUntil(openAt);
+    sleepUntil(openAt, 'open');
     const opened = http.post(`${SERVER}/api/quiz/quiz-exercises/${config.quizId}/start-participation`, null, params(student, { type: 'start-participation' }, 'text'));
     const questions = opened.status === 200 ? opened.json('exercise.quizQuestions') : null;
     if (!check(opened, { 'start-participation returns the questions': () => Array.isArray(questions) && questions.length > 0 })) {
@@ -168,7 +177,7 @@ export default function (run) {
         check(saved, { 'save succeeds': (response) => response.status === 200 });
     }
 
-    sleepUntil(submitAt);
+    sleepUntil(submitAt, 'submit');
     const submitted = http.post(`${live}?submit=true`, JSON.stringify(submission(questions, index + SAVES + 1)), params(student, { type: 'submit' }));
     const inTime = Date.now() <= run.due;
     if (check(submitted, { 'submit succeeds': (response) => response.status === 200, 'submit answered before the due date': () => inTime })) {
@@ -186,8 +195,20 @@ export function handleSummary(data) {
         const values = data.metrics[`http_req_duration{type:${type}}`]?.values ?? {};
         return `${type}: n=${values.count ?? 0} med=${values.med?.toFixed(1)} ms p95=${values['p(95)']?.toFixed(1)} ms p99=${values['p(99)']?.toFixed(1)} ms`;
     };
+    const lag = (step) => {
+        const values = data.metrics[`phase1_schedule_lag{step:${step}}`]?.values ?? {};
+        return `schedule lag ${step}: p99=${values['p(99)']?.toFixed(1)} ms max=${values.max?.toFixed(1)} ms`;
+    };
+    const behind = data.metrics.phase1_behind_schedule?.values.count ?? 0;
     return {
         [`${OUT}/summary.json`]: JSON.stringify(data, null, 2),
-        stdout: `${[`Phase 1 (${QUIZ} quiz ${config.quizId}, ${STUDENTS} students, seed ${SEED})`, ...TYPES.map(line), failed.length ? `FAILED thresholds: ${failed.join(', ')}` : 'all thresholds hold'].join('\n')}\n`,
+        stdout: `${[
+            `Phase 1 (${QUIZ} quiz ${config.quizId}, ${STUDENTS} students, seed ${SEED})`,
+            ...TYPES.map(line),
+            lag('open'),
+            lag('submit'),
+            `behind schedule: ${behind}`,
+            failed.length ? `FAILED thresholds: ${failed.join(', ')}` : 'all thresholds hold',
+        ].join('\n')}\n`,
     };
 }

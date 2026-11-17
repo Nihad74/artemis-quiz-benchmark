@@ -120,15 +120,16 @@ await forEachLimited(logins, PARALLEL, async (login, index) => {
 const due = new Date((await teacher.get(`/api/quiz/quiz-exercises/${evaluatedQuiz}`)).data.dueDate).getTime();
 console.log(`quiz ${evaluatedQuiz}: ${students} submissions, due ${new Date(due).toISOString()}`);
 
-// The scheduled task evaluates the quiz at its due date; the point statistic then counts every student.
-const deadline = due + 120_000;
+// The scheduled task evaluates the quiz at its due date; the point statistic then counts every student. The baseline
+// evaluates 50 students in about 2 s; 600 s leave room for thousands.
+const deadline = due + 600_000;
 for (;;) {
     const { statistic } = await pointStatistic(teacher, evaluatedQuiz);
     if (statistic?.participantsRated === students) {
         break;
     }
     if (Date.now() > deadline) {
-        throw new Error(`quiz ${evaluatedQuiz} not evaluated 120 s after its due date: ${JSON.stringify(statistic?.participantsRated)} rated participants`);
+        throw new Error(`quiz ${evaluatedQuiz} not evaluated 600 s after its due date: ${JSON.stringify(statistic?.participantsRated)} rated participants`);
     }
     await new Promise((resolve) => setTimeout(resolve, 2000));
 }
