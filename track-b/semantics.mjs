@@ -11,18 +11,23 @@
  * - the text exercise of the control workflow and the warm-up and benchmark quizzes, which must still be unstarted.
  *
  * Components are keyed by content (option text, drop location position, drag item text, spot number), never by id.
- * Read-only for the evaluated quiz. Logs in every user once; rate limiting is off (compose.yml). Usage:
- *   node semantics.mjs --manifest manifest.json [--server URL] --out semantics.json
+ * Read-only for an evaluated quiz: --quiz evaluated (default, the seeded quiz) or, after a load test has run and the
+ * quiz is evaluated, benchmark or warmUp (D38 rule 7: both commits of a comparison must give the same result; every
+ * student of the manifest must have taken that quiz). Logs in every user once; rate limiting is off (compose.yml). Usage:
+ *   node semantics.mjs --manifest manifest.json [--server URL] [--quiz evaluated] --out semantics.json
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { Client, forEachLimited } from './lib/client.mjs';
 import { pointStatistic } from './lib/quiz.mjs';
 
-const { values: args } = parseArgs({ options: { manifest: { type: 'string' }, server: { type: 'string' }, out: { type: 'string' } } });
+const { values: args } = parseArgs({ options: { manifest: { type: 'string' }, server: { type: 'string' }, quiz: { type: 'string', default: 'evaluated' }, out: { type: 'string' } } });
 const manifest = JSON.parse(readFileSync(args.manifest, 'utf8'));
 const server = args.server ?? manifest.server;
-const quizId = manifest.evaluatedQuiz;
+const quizId = { evaluated: manifest.evaluatedQuiz, benchmark: manifest.benchmarkQuiz, warmUp: manifest.warmUpQuiz }[args.quiz];
+if (quizId === undefined) {
+    throw new Error(`--quiz must be evaluated, benchmark, or warmUp, not ${args.quiz}`);
+}
 
 const teacher = await new Client(server).login(manifest.instructor, manifest.password);
 const quiz = (await teacher.get(`/api/quiz/quiz-exercises/${quizId}`)).data;

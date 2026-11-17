@@ -12,8 +12,9 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-k6_cpuset="${K6_CPUSET:-10-13}"
-k6_memory="${K6_MEMORY:-4g}"
+source "$here/lib/k6-limits.sh"
+k6_cpuset="$K6_CPUSET"
+k6_memory="$K6_MEMORY"
 vm_reserve="${VM_RESERVE:-1g}"
 
 # "6g", "512m", "2048k" or bytes -> bytes.

@@ -1,6 +1,6 @@
 /**
  * The Track B quiz (decision D10, Section 5.1 of the decisions): 10 questions, 4 multiple-choice, 3 drag-and-drop,
- * 3 short-answer, and the deterministic answers of every student.
+ * 3 short-answer. The answers of the students are in lib/answers.mjs.
  *
  * Every component has a content key that survives a migration and does not depend on database ids: the option text, the
  * drop location position, the drag item text, the spot number, the solution text. Drag items are text-only; the
@@ -71,39 +71,6 @@ export function createRequest({ title, releaseDate, duration }) {
 }
 
 /**
- * The live submission a student sends: for question `q` (0-based) and variant `v` the answer is correct unless
- * `(v + q)` is divisible by 3. Students therefore fall into three groups with different scores, so the point statistic
- * has more than one counter. `quiz` is the quiz as a student loads it (ids of options, drop locations, drag items, spots).
- */
-export function submission(quiz, variant) {
-    const submittedAnswers = quiz.quizQuestions.map((question, index) => {
-        const correct = (variant + index) % 3 !== 0;
-        const quizQuestion = { id: question.id, type: question.type };
-        if (question.type === 'multiple-choice') {
-            const options = sortBy(question.answerOptions, (option) => option.text);
-            return { type: question.type, quizQuestion, selectedOptions: options.filter((_, option) => (option % 2 === 0) === correct).map((option) => ({ id: option.id })) };
-        }
-        if (question.type === 'drag-and-drop') {
-            const items = sortBy(question.dragItems, (item) => item.text);
-            const locations = sortBy(question.dropLocations, (location) => location.posX);
-            const shift = correct ? 0 : 1;
-            return {
-                type: question.type,
-                quizQuestion,
-                mappings: items.map((item, slot) => ({ dragItem: { id: item.id }, dropLocation: { id: locations[(slot + shift) % locations.length].id } })),
-            };
-        }
-        const spots = sortBy(question.spots, (spot) => spot.spotNr);
-        return {
-            type: question.type,
-            quizQuestion,
-            submittedTexts: spots.map((spot) => ({ text: correct ? `q${index + 1}s${spot.spotNr}` : 'wrong', spot: { id: spot.id } })),
-        };
-    });
-    return { submissionExerciseType: 'quiz', submittedAnswers };
-}
-
-/**
  * The point statistic of a quiz as `client` sees it, and where it comes from: the statistics endpoint (on-demand statistics,
  * from 24a062759c2 on) or the statistic stored with the quiz (before; the endpoint answers 404 there).
  */
@@ -116,8 +83,4 @@ export async function pointStatistic(client, quizId) {
         const { data } = await client.get(`/api/quiz/quiz-exercises/${quizId}`);
         return { source: 'stored statistics', statistic: data.quizPointStatistic };
     }
-}
-
-function sortBy(list, key) {
-    return [...list].sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
 }

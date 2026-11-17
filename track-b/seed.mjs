@@ -21,7 +21,8 @@
 import { writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { Client, forEachLimited, multipart } from './lib/client.mjs';
-import { createRequest, pointStatistic, submission } from './lib/quiz.mjs';
+import { submission } from './lib/answers.mjs';
+import { createRequest, pointStatistic } from './lib/quiz.mjs';
 
 const { values: args } = parseArgs({
     options: {
@@ -113,8 +114,8 @@ await forEachLimited(logins, PARALLEL, async (login, index) => {
     const client = await new Client(args.server).login(login, args.password);
     const quiz = (await client.get(`/api/quiz/quiz-exercises/${evaluatedQuiz}/for-student`)).data;
     await client.post(`/api/quiz/quiz-exercises/${evaluatedQuiz}/start-participation`);
-    await client.post(`/api/quiz/exercises/${evaluatedQuiz}/submissions/live?submit=false`, submission(quiz, index + 1));
-    await client.post(`/api/quiz/exercises/${evaluatedQuiz}/submissions/live?submit=true`, submission(quiz, index + 2));
+    await client.post(`/api/quiz/exercises/${evaluatedQuiz}/submissions/live?submit=false`, submission(quiz.quizQuestions, index + 1));
+    await client.post(`/api/quiz/exercises/${evaluatedQuiz}/submissions/live?submit=true`, submission(quiz.quizQuestions, index + 2));
 });
 const due = new Date((await teacher.get(`/api/quiz/quiz-exercises/${evaluatedQuiz}`)).data.dueDate).getTime();
 console.log(`quiz ${evaluatedQuiz}: ${students} submissions, due ${new Date(due).toISOString()}`);
