@@ -172,7 +172,8 @@ measure() {
     log "run $repetition-$side: Phase 1, $students students"
     pg_stat "$measured" >"$dir/pg-stat-before.csv"
     compose "$measured" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-before.txt"
-    sample "$measured" "$dir" &
+    # Errors of single samples (for example a container that exits during docker stats) go to sampler.log.
+    sample "$measured" "$dir" 2>>"$dir/sampler.log" &
     sampler_pid=$!
     "$here/k6.sh" "$project" phase1.js "$dir/phase1" -e QUIZ=benchmark -e SEED="$schedule_seed" \
         >"$dir/phase1/k6.log" 2>&1 || phase1_exit=$?
