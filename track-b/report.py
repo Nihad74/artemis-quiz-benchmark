@@ -238,7 +238,7 @@ def run_set_section(folder, label, rng):
         per_side = {side: [v for v in (value(run) for run in valid[side]) if v is not None] for side in "AB"}
         change = "–"
         if per_side["A"] and per_side["B"] and statistics.median(per_side["A"]):
-            change = f"{(statistics.median(per_side['B']) / statistics.median(per_side['A']) - 1) * 100:+.0f}%"
+            change = f"{(statistics.median(per_side['B']) / statistics.median(per_side['A']) - 1) * 100:+.1f}%"
         out.append(f"| {name} | {median_with_interval(per_side['A'], rng)} | {median_with_interval(per_side['B'], rng)} | {change} |")
     out.append("")
     return out, runs
