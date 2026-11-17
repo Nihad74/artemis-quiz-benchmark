@@ -12,7 +12,8 @@
  *
  * Environment:
  *   SERVER    base URL of Artemis (k6.sh: http://artemis:8080)
- *   OUT       folder with manifest.json and sessions.json (login.mjs); summary.json is written there
+ *   OUT       folder with manifest.json and sessions.json (login.mjs); summary.json and questions.json (ids and titles of
+ *             the questions, for phase2.js) are written there
  *   QUIZ      benchmark (default) or warmUp (D38 rule 5)
  *   SEED      schedule seed (default 1)
  *   STUDENTS  the first N students of sessions.json take part (default: all; the warm-up uses 100)
@@ -27,6 +28,7 @@ import exec from 'k6/execution';
 import http from 'k6/http';
 import { Counter, Trend } from 'k6/metrics';
 import { submission } from './lib/answers.mjs';
+import { failedThresholds, params, prng, trendLine, useSession } from './lib/k6.js';
 
 const SERVER = __ENV.SERVER;
 const OUT = __ENV.OUT;
@@ -91,22 +93,6 @@ export const options = {
     },
 };
 
-function params(session, tags, responseType = 'none') {
-    const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
-    if (session.xsrf !== null) {
-        headers['X-XSRF-TOKEN'] = session.xsrf;
-    }
-    return { headers, tags, responseType };
-}
-
-/** Puts the session cookies into this VU's jar, as a browser holds them; cookies the server sets later replace them. */
-function useSession(session) {
-    const jar = http.cookieJar();
-    for (const [name, value] of Object.entries(session.cookies)) {
-        jar.set(SERVER, name, value);
-    }
-}
-
 /** Sleeps until `time` and records how late the VU woke up; if `time` has passed already, counts that instead. */
 function sleepUntil(time, step) {
     const wait = time - Date.now();
@@ -118,20 +104,8 @@ function sleepUntil(time, step) {
     }
 }
 
-/** mulberry32: a small seeded PRNG, one stream per student. */
-function prng(seed) {
-    let state = seed >>> 0;
-    return () => {
-        state = (state + 0x6d2b79f5) >>> 0;
-        let t = state;
-        t = Math.imul(t ^ (t >>> 15), t | 1);
-        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-}
-
 export function setup() {
-    useSession(instructor);
+    useSession(SERVER, instructor);
     const quizUrl = `${SERVER}/api/quiz/quiz-exercises/${config.quizId}`;
     const before = http.get(quizUrl, params(instructor, { type: 'setup' }, 'text'));
     if (before.status !== 200) {
@@ -149,7 +123,13 @@ export function setup() {
     if (!dueDate) {
         fail(`quiz ${config.quizId} has no due date after start-now`);
     }
-    return { start, due: Date.parse(dueDate) };
+    // The question ids of the instructor view, for phase2.js: read here, before Phase 1, so that Phase 2 sends no extra
+    // request that would warm the server for the statistics pages.
+    const questions = before
+        .json('quizQuestions')
+        .map(({ id, title }) => ({ id, title }))
+        .sort((a, b) => Number(a.title.slice(1)) - Number(b.title.slice(1)));
+    return { start, due: Date.parse(dueDate), questions };
 }
 
 export default function (run) {
@@ -160,7 +140,7 @@ export default function (run) {
     const openAt = run.start + random() * OPEN_WINDOW_MS;
     const thinks = Array.from({ length: SAVES }, () => between(THINK_MS));
     const submitAt = run.due - between(SUBMIT_BEFORE_DUE_MS);
-    useSession(student);
+    useSession(SERVER, student);
 
     sleepUntil(openAt, 'open');
     const opened = http.post(`${SERVER}/api/quiz/quiz-exercises/${config.quizId}/start-participation`, null, params(student, { type: 'start-participation' }, 'text'));
@@ -188,13 +168,7 @@ export default function (run) {
 }
 
 export function handleSummary(data) {
-    const failed = Object.entries(data.metrics)
-        .filter(([, metric]) => metric.thresholds && Object.values(metric.thresholds).some((threshold) => !threshold.ok))
-        .map(([name]) => name);
-    const line = (type) => {
-        const values = data.metrics[`http_req_duration{type:${type}}`]?.values ?? {};
-        return `${type}: n=${values.count ?? 0} med=${values.med?.toFixed(1)} ms p95=${values['p(95)']?.toFixed(1)} ms p99=${values['p(99)']?.toFixed(1)} ms`;
-    };
+    const failed = failedThresholds(data);
     const lag = (step) => {
         const values = data.metrics[`phase1_schedule_lag{step:${step}}`]?.values ?? {};
         return `schedule lag ${step}: p99=${values['p(99)']?.toFixed(1)} ms max=${values.max?.toFixed(1)} ms`;
@@ -202,9 +176,10 @@ export function handleSummary(data) {
     const behind = data.metrics.phase1_behind_schedule?.values.count ?? 0;
     return {
         [`${OUT}/summary.json`]: JSON.stringify(data, null, 2),
+        [`${OUT}/questions.json`]: `${JSON.stringify(data.setup_data?.questions ?? [])}\n`,
         stdout: `${[
             `Phase 1 (${QUIZ} quiz ${config.quizId}, ${STUDENTS} students, seed ${SEED})`,
-            ...TYPES.map(line),
+            ...TYPES.map((type) => trendLine(data, `http_req_duration{type:${type}}`, type)),
             lag('open'),
             lag('submit'),
             `behind schedule: ${behind}`,
