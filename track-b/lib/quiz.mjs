@@ -7,6 +7,8 @@
  * background image of each drag-and-drop question exercises the file storage.
  */
 
+import { HttpError } from './client.mjs';
+
 // A valid 1x1 PNG; the server stores the file and only checks the extension.
 export const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64');
 
@@ -99,6 +101,21 @@ export function submission(quiz, variant) {
         };
     });
     return { submissionExerciseType: 'quiz', submittedAnswers };
+}
+
+/**
+ * The point statistic of a quiz as `client` sees it, and where it comes from: the statistics endpoint (on-demand statistics,
+ * from 24a062759c2 on) or the statistic stored with the quiz (before; the endpoint answers 404 there).
+ */
+export async function pointStatistic(client, quizId) {
+    try {
+        const { data } = await client.get(`/api/quiz/quiz-exercises/${quizId}/statistics/points`);
+        return { source: 'statistics endpoints', statistic: data.quizPointStatistic };
+    } catch (error) {
+        if (!(error instanceof HttpError) || error.status !== 404) throw error;
+        const { data } = await client.get(`/api/quiz/quiz-exercises/${quizId}`);
+        return { source: 'stored statistics', statistic: data.quizPointStatistic };
+    }
 }
 
 function sortBy(list, key) {

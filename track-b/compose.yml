@@ -3,6 +3,16 @@
 #   ARTEMIS_IMAGE=artemis-thesis:<commit> docker compose -p <project> -f compose.yml up -d --wait
 #
 # Every commit runs on the same PostgreSQL version (D36). The project name separates the volumes of parallel setups.
+#
+# Isolation (D36): Artemis and PostgreSQL run on separate CPUs with a memory limit each, without swap; the heap is fixed
+# (JAVA_HEAP). The defaults fit Docker Desktop on the local Mac (14 CPUs): Artemis 0-5, PostgreSQL 6-9, and CPUs 10-13
+# stay free for the load generator. Override them per environment and record the values with each run. On the Mac, the
+# memory limits need a Docker memory limit of about 10 GB to leave room for the load generator.
+#
+# Metrics: Prometheus is enabled in the application.yml of every compared commit. /management/prometheus answers only
+# requests from spring.prometheus.monitoringIp (127.0.0.1; "localhost" resolves to ::1 and gets 401), so collect it
+# inside the container:
+#   docker compose -p <project> -f compose.yml exec artemis wget -qO- http://127.0.0.1:8080/management/prometheus
 
 services:
     postgres:
@@ -16,6 +26,9 @@ services:
         volumes:
             - postgres-data:/var/lib/postgresql
         shm_size: 256m
+        cpuset: ${POSTGRES_CPUSET:-6-9}
+        mem_limit: ${POSTGRES_MEMORY:-2g}
+        memswap_limit: ${POSTGRES_MEMORY:-2g}
         healthcheck:
             test: pg_isready -h 127.0.0.1 -U Artemis -d Artemis
             interval: 2s
@@ -27,6 +40,9 @@ services:
         depends_on:
             postgres:
                 condition: service_healthy
+        cpuset: ${ARTEMIS_CPUSET:-0-5}
+        mem_limit: ${ARTEMIS_MEMORY:-6g}
+        memswap_limit: ${ARTEMIS_MEMORY:-6g}
         environment:
             # The profiles of the Artemis migration check (deployment/docker/artemis/config/migration-check.env): no version
             # control, no continuous integration, no external services. The quiz module needs none of them.
@@ -51,7 +67,9 @@ services:
             INFO_OPERATORADMINNAME: Thesis Benchmark
             INFO_UNIVERSITYNAME: Thesis Benchmark
             INFO_TESTSERVER: "true"
-            MANAGEMENT_METRICS_EXPORT_PROMETHEUS_ENABLED: "true"
+            # Off by default in every compared commit; pinned so that seeding, the semantics check, and the load test can
+            # log in thousands of users at any rate (the login limit is 30 per minute when enabled).
+            ARTEMIS_RATELIMITING_ENABLED: "false"
         ports:
             - "127.0.0.1:${ARTEMIS_PORT:-18080}:8080"
         volumes:

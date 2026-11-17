@@ -1,20 +1,23 @@
 #!/usr/bin/env node
 /**
- * Decision D19 for Track B: what instructors and students see of the evaluated quiz, normalized to content so that two
+ * Decision D19 for Track B: what instructors, tutors and students see of the seeded data, normalized to content so that two
  * commits (or one database before and after the forward migration) can be compared with `diff`:
  *
- * - the questions with their solutions (instructor view of the quiz);
+ * - the questions of the evaluated quiz with their solutions (instructor view);
  * - every student's stored answers and scores, as the student sees them after the quiz (start-participation);
  * - the statistics: the stored statistics of the quiz (relational baseline) or the statistics endpoints (on-demand
- *   statistics, from 24a062759c2 on), whichever the server offers.
+ *   statistics, from 24a062759c2 on), whichever the server offers;
+ * - the rated participants in the point statistic as each tutor sees it: the tutors read the statistics in Phase 2;
+ * - the text exercise of the control workflow and the warm-up and benchmark quizzes, which must still be unstarted.
  *
  * Components are keyed by content (option text, drop location position, drag item text, spot number), never by id.
- * Read-only for the evaluated quiz. Usage:
+ * Read-only for the evaluated quiz. Logs in every user once; rate limiting is off (compose.yml). Usage:
  *   node semantics.mjs --manifest manifest.json [--server URL] --out semantics.json
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
-import { Client, forEachLimited, HttpError } from './lib/client.mjs';
+import { Client, forEachLimited } from './lib/client.mjs';
+import { pointStatistic } from './lib/quiz.mjs';
 
 const { values: args } = parseArgs({ options: { manifest: { type: 'string' }, server: { type: 'string' }, out: { type: 'string' } } });
 const manifest = JSON.parse(readFileSync(args.manifest, 'utf8'));
@@ -117,23 +120,30 @@ async function statistics() {
         // Counters that count nobody carry no information; the on-demand endpoints omit them.
         counters: sorted((statistic.pointCounters ?? []).filter((entry) => entry.ratedCounter || entry.unRatedCounter).map((entry) => [entry.points, entry.ratedCounter, entry.unRatedCounter])),
     });
-    try {
-        const base = `/api/quiz/quiz-exercises/${quizId}/statistics`;
-        const pointStatistic = (await teacher.get(`${base}/points`)).data.quizPointStatistic;
-        const perQuestion = [];
-        for (const entry of questions) {
-            perQuestion.push(question(entry.title, (await teacher.get(`${base}/questions/${entry.id}`)).data.quizQuestionStatistic));
-        }
-        return { source: 'statistics endpoints', points: points(pointStatistic), questions: perQuestion };
-    } catch (error) {
-        if (!(error instanceof HttpError) || error.status !== 404) throw error;
-        return {
-            source: 'stored statistics',
-            points: points(quiz.quizPointStatistic),
-            questions: questions.map((entry) => question(entry.title, entry.quizQuestionStatistic)),
-        };
+    const { source, statistic: pointCounts } = await pointStatistic(teacher, quizId);
+    if (source === 'stored statistics') {
+        return { source, points: points(pointCounts), questions: questions.map((entry) => question(entry.title, entry.quizQuestionStatistic)) };
     }
+    const perQuestion = [];
+    for (const entry of questions) {
+        perQuestion.push(question(entry.title, (await teacher.get(`/api/quiz/quiz-exercises/${quizId}/statistics/questions/${entry.id}`)).data.quizQuestionStatistic));
+    }
+    return { source, points: points(pointCounts), questions: perQuestion };
 }
+
+const tutors = {};
+await forEachLimited(manifest.tutors, 8, async (login) => {
+    const client = await new Client(server).login(login, manifest.password);
+    tutors[login] = { pointStatisticParticipantsRated: (await pointStatistic(client, quizId)).statistic.participantsRated };
+});
+
+// Dates as instants: the JSON format of a date can change between versions, the instant must not.
+const instant = (value) => (value ? new Date(value).toISOString() : null);
+async function unstartedQuiz(id) {
+    const { data } = await teacher.get(`/api/quiz/quiz-exercises/${id}`);
+    return { title: data.title, quizMode: data.quizMode, duration: data.duration, questions: data.quizQuestions.length, releaseDate: instant(data.releaseDate), dueDate: instant(data.dueDate) };
+}
+const textExercise = (await teacher.get(`/api/text/text-exercises/${manifest.textExercise}`)).data;
 
 const statistic = await statistics();
 const result = {
@@ -141,6 +151,17 @@ const result = {
     students: Object.fromEntries(Object.entries(students).sort(([a], [b]) => a.localeCompare(b))),
     statisticsSource: statistic.source,
     statistics: { points: statistic.points, questions: statistic.questions },
+    tutors: Object.fromEntries(Object.entries(tutors).sort(([a], [b]) => a.localeCompare(b))),
+    textExercise: {
+        title: textExercise.title,
+        maxPoints: textExercise.maxPoints,
+        mode: textExercise.mode,
+        includedInOverallScore: textExercise.includedInOverallScore,
+        releaseDate: instant(textExercise.releaseDate),
+        dueDate: instant(textExercise.dueDate),
+    },
+    warmUpQuiz: await unstartedQuiz(manifest.warmUpQuiz),
+    benchmarkQuiz: await unstartedQuiz(manifest.benchmarkQuiz),
 };
 writeFileSync(args.out, JSON.stringify(result, null, 2) + '\n');
-console.log(`wrote ${args.out} (${Object.keys(students).length} students, ${statistic.source})`);
+console.log(`wrote ${args.out} (${Object.keys(students).length} students, ${Object.keys(tutors).length} tutors, ${statistic.source})`);
