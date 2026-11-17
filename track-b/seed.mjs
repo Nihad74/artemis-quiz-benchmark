@@ -10,7 +10,12 @@
  * - the warm-up quiz (D38 rule 5) and the benchmark quiz: the same 10 questions, not started (D13), `--benchmark-duration`
  *   seconds long (Section 5.1). The load test starts them with start-now.
  *
- * Writes a manifest with the ids and logins. Usage:
+ * The seed speaks the REST API of Artemis 9.9 and refuses other versions. Every other compared commit gets its data by
+ * forward migration of the seed's dump (D2, same-data rule): the candidate no longer has the admin course path the seed
+ * uses, and on a fresh database at 24a062759c2 the internal admin cannot be created (`jhi_user.learner_profile_id` is
+ * missing), so every login fails.
+ *
+ * Writes a manifest with the ids, the logins, and the version and commit of the server. Usage:
  *   node seed.mjs --server http://localhost:18080 --students 20 --out manifest.json
  */
 import { writeFileSync } from 'node:fs';
@@ -33,6 +38,12 @@ const { values: args } = parseArgs({
 });
 const students = Number(args.students);
 const PARALLEL = 8;
+const SEED_VERSION = '9.9';
+
+const info = (await new Client(args.server).get('/management/info')).data;
+if (info.build?.version !== SEED_VERSION) {
+    throw new Error(`the seed runs on Artemis ${SEED_VERSION} (the relational baseline 43bafcee17c), but ${args.server} is ${info.build?.version}; seed the baseline and migrate the dump forward`);
+}
 
 // The internal admin of compose.yml.
 const admin = await new Client(args.server).login('artemis_admin', 'thesis-track-b-local-admin');
@@ -129,6 +140,8 @@ console.log(`quizzes ${warmUpQuiz} (warm-up) and ${benchmarkQuiz} (benchmark): $
 
 const manifest = {
     server: args.server,
+    serverVersion: info.build.version,
+    serverCommit: info.git?.commit?.id?.full ?? null,
     courseId: course.id,
     instructor,
     tutors,

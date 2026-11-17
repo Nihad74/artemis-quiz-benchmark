@@ -6,8 +6,8 @@
 #
 # Isolation (D36): Artemis and PostgreSQL run on separate CPUs with a memory limit each, without swap; the heap is fixed
 # (JAVA_HEAP). The defaults fit Docker Desktop on the local Mac (14 CPUs): Artemis 0-5, PostgreSQL 6-9, and CPUs 10-13
-# stay free for the load generator. Override them per environment and record the values with each run. On the Mac, the
-# memory limits need a Docker memory limit of about 10 GB to leave room for the load generator.
+# stay free for the load generator. Override them per environment and record the values with each run. check-host.sh
+# checks that the Docker engine can hold these limits plus the load generator.
 #
 # Metrics: Prometheus is enabled in the application.yml of every compared commit. /management/prometheus answers only
 # requests from spring.prometheus.monitoringIp (127.0.0.1; "localhost" resolves to ::1 and gets 401), so collect it
@@ -51,6 +51,10 @@ services:
             SPRING_DATASOURCE_USERNAME: Artemis
             SPRING_DATASOURCE_PASSWORD: ""
             SPRING_LIQUIBASE_CONTEXTS: prod
+            # Every compared commit ships Hikari's default of 10 connections (application-prod.yml sets no size), which
+            # would cap concurrency before the quiz code does. 100 is the size of the repository's own load-test stacks
+            # (prod-multinode-fast.env, playwright.env at the baseline and the candidate); the same for every commit.
+            SPRING_DATASOURCE_HIKARI_MAXIMUMPOOLSIZE: ${ARTEMIS_DB_POOL_SIZE:-100}
             JAVA_HEAP: ${JAVA_HEAP:--Xms4g -Xmx4g}
             ARTEMIS_USERMANAGEMENT_USEEXTERNAL: "false"
             ARTEMIS_USERMANAGEMENT_INTERNALADMIN_USERNAME: artemis_admin
