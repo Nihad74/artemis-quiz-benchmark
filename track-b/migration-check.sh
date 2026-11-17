@@ -2,6 +2,8 @@
 # Forward-migration check for the Track B same-data rule (decisions D2, D19).
 #
 # Usage: migration-check.sh <output-folder> <students> <first-image> [<step-image> ...] <last-image>
+# EVALUATED_DURATION (default 60) is the duration of the seeded evaluated quiz in seconds: every student must load, start,
+# save, and submit within it, so thousands of students need more (2000 students: 300).
 #
 # 1. Start the first image on an empty database; Liquibase creates the schema.
 # 2. Seed it (seed.mjs): users, a course, an evaluated quiz with answers, results and statistics, and a benchmark quiz.
@@ -40,7 +42,8 @@ printf '%s\n' "${images[@]}" >"$out/images.txt"
 log "start $first on an empty database"
 compose "$first" up -d --wait --wait-timeout 900 >/dev/null 2>&1
 log "seed $students students"
-node "$here/seed.mjs" --server "http://localhost:$ARTEMIS_PORT" --students "$students" --out "$out/manifest.json"
+node "$here/seed.mjs" --server "http://localhost:$ARTEMIS_PORT" --students "$students" \
+    --evaluated-duration "${EVALUATED_DURATION:-60}" --out "$out/manifest.json"
 node "$here/semantics.mjs" --manifest "$out/manifest.json" --out "$out/old.json"
 
 log "dump the database and the file storage"
