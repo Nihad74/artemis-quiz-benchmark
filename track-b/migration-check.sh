@@ -30,12 +30,7 @@ project="trackb-migration"
 export ARTEMIS_PORT="${ARTEMIS_PORT:-18080}"
 export JAVA_HEAP="${JAVA_HEAP:--Xms2g -Xmx2g}"
 
-compose() {
-    local image="$1"
-    shift
-    ARTEMIS_IMAGE="$image" docker compose -p "$project" -f "$here/compose.yml" "$@"
-}
-log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+source "$here/lib/stack.sh"
 
 first="${images[0]}"
 compose "$first" down -v --remove-orphans >/dev/null 2>&1 || true
@@ -52,13 +47,9 @@ log "dump the database and the file storage"
 compose "$first" stop artemis >/dev/null 2>&1
 compose "$first" exec -T postgres pg_dump -U Artemis -d Artemis -Fc >"$out/seed.dump"
 docker run --rm -v "${project}_artemis-data:/data:ro" -v "$out:/backup" alpine:3.24.3 tar czf /backup/artemis-data.tgz -C /data .
-compose "$first" down -v >/dev/null 2>&1
 
 log "restore into fresh volumes"
-compose "$first" create >/dev/null 2>&1
-compose "$first" up -d --wait postgres >/dev/null 2>&1
-compose "$first" exec -T postgres pg_restore -U Artemis -d Artemis --no-owner --exit-on-error <"$out/seed.dump"
-docker run --rm -v "${project}_artemis-data:/data" -v "$out:/backup:ro" alpine:3.24.3 sh -c 'tar xzf /backup/artemis-data.tgz -C /data && chown -R 1337:1337 /data'
+restore_seed "$first" "$out"
 
 for image in "${images[@]:1}"; do
     name="${image#*:}"

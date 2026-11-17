@@ -12,16 +12,19 @@
  *
  * Components are keyed by content (option text, drop location position, drag item text, spot number), never by id.
  * Read-only for an evaluated quiz: --quiz evaluated (default, the seeded quiz) or, after a load test has run and the
- * quiz is evaluated, benchmark or warmUp (D38 rule 7: both commits of a comparison must give the same result; every
- * student of the manifest must have taken that quiz). Logs in every user once; rate limiting is off (compose.yml). Usage:
- *   node semantics.mjs --manifest manifest.json [--server URL] [--quiz evaluated] --out semantics.json
+ * quiz is evaluated, benchmark or warmUp (D38 rule 7: both commits of a comparison must give the same result). Only
+ * students who took that quiz may be read (start-participation would start one): --students N limits the check to the
+ * first N of the manifest, as login.mjs does. Logs in every user once; rate limiting is off (compose.yml). Usage:
+ *   node semantics.mjs --manifest manifest.json [--server URL] [--quiz evaluated] [--students N] --out semantics.json
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { Client, forEachLimited } from './lib/client.mjs';
 import { pointStatistic } from './lib/quiz.mjs';
 
-const { values: args } = parseArgs({ options: { manifest: { type: 'string' }, server: { type: 'string' }, quiz: { type: 'string', default: 'evaluated' }, out: { type: 'string' } } });
+const { values: args } = parseArgs({
+    options: { manifest: { type: 'string' }, server: { type: 'string' }, quiz: { type: 'string', default: 'evaluated' }, students: { type: 'string' }, out: { type: 'string' } },
+});
 const manifest = JSON.parse(readFileSync(args.manifest, 'utf8'));
 const server = args.server ?? manifest.server;
 const quizId = { evaluated: manifest.evaluatedQuiz, benchmark: manifest.benchmarkQuiz, warmUp: manifest.warmUpQuiz }[args.quiz];
@@ -91,7 +94,7 @@ function answer(submitted) {
 }
 
 const students = {};
-await forEachLimited(manifest.students, 8, async (login) => {
+await forEachLimited(manifest.students.slice(0, args.students === undefined ? undefined : Number(args.students)), 8, async (login) => {
     const client = await new Client(server).login(login, manifest.password);
     const participation = (await client.post(`/api/quiz/quiz-exercises/${quizId}/start-participation`)).data;
     const submission = participation.submissions?.[0] ?? {};

@@ -15,6 +15,7 @@
  *   OUT       folder with manifest.json and sessions.json (login.mjs); summary.json is written there
  *   QUIZ      benchmark (default) or warmUp (D38 rule 5)
  *   SEED      schedule seed (default 1)
+ *   STUDENTS  the first N students of sessions.json take part (default: all; the warm-up uses 100)
  *
  * Requests carry the tag `type` (start-participation, save, submit; save also `save` 1 to 3). A run is valid only if all
  * thresholds hold (k6 exit status 0): no failed request or check, every student submitted before the due date (D38
@@ -48,6 +49,10 @@ const config = new SharedArray('config', () => {
 })[0];
 const instructor = new SharedArray('instructor', () => [JSON.parse(open(`${OUT}/sessions.json`)).instructor])[0];
 const students = new SharedArray('students', () => JSON.parse(open(`${OUT}/sessions.json`)).students);
+const STUDENTS = Number(__ENV.STUDENTS ?? students.length);
+if (!(STUDENTS >= 1 && STUDENTS <= students.length)) {
+    throw new Error(`STUDENTS must be between 1 and ${students.length}, not ${__ENV.STUDENTS}`);
+}
 
 if (config.duration * 1000 < OPEN_WINDOW_MS + SAVES * THINK_MS[1] + SUBMIT_BEFORE_DUE_MS[1]) {
     throw new Error(`a ${config.duration} s quiz is too short for the Phase 1 schedule`);
@@ -62,7 +67,7 @@ export const options = {
     scenarios: {
         phase1: {
             executor: 'per-vu-iterations',
-            vus: students.length,
+            vus: STUDENTS,
             iterations: 1,
             // The schedule ends at the due date; the margin covers the last responses.
             maxDuration: `${config.duration + 60}s`,
@@ -73,7 +78,7 @@ export const options = {
         checks: ['rate==1'],
         http_req_failed: ['rate==0'],
         dropped_iterations: ['count==0'],
-        phase1_submitted_in_time: [`count==${students.length}`],
+        phase1_submitted_in_time: [`count==${STUDENTS}`],
         phase1_failed_students: ['count==0'],
         // Always-true thresholds make k6 keep these submetrics in the summary.
         ...Object.fromEntries(TYPES.map((type) => [`http_req_duration{type:${type}}`, ['max>=0']])),
@@ -183,6 +188,6 @@ export function handleSummary(data) {
     };
     return {
         [`${OUT}/summary.json`]: JSON.stringify(data, null, 2),
-        stdout: `${[`Phase 1 (${QUIZ} quiz ${config.quizId}, ${students.length} students, seed ${SEED})`, ...TYPES.map(line), failed.length ? `FAILED thresholds: ${failed.join(', ')}` : 'all thresholds hold'].join('\n')}\n`,
+        stdout: `${[`Phase 1 (${QUIZ} quiz ${config.quizId}, ${STUDENTS} students, seed ${SEED})`, ...TYPES.map(line), failed.length ? `FAILED thresholds: ${failed.join(', ')}` : 'all thresholds hold'].join('\n')}\n`,
     };
 }
