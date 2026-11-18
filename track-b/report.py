@@ -347,8 +347,8 @@ def main():
         f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC from the run folders below. Do not edit by hand; run the "
         "script again after new runs. Setup and methods: `quiz-benchmark-track-b-setup.md`; decisions: `quiz-benchmark-decisions.md`.",
         "",
-        f"Environment of the last run set: {host.get('cpuModel', '?')}, {host.get('engine', '?')}, {host.get('engineCpus', '?')} CPUs and "
-        f"{(host.get('engineMemory') or 0) / 2**20:.0f} MiB for Docker. Results of different environments are never combined (D36).",
+        f"Environment (D36: every run set runs on the local Mac): {host.get('cpuModel', '?')}, {host.get('engine', '?')}, "
+        f"{host.get('engineCpus', '?')} CPUs and {(host.get('engineMemory') or 0) / 2**20:.0f} MiB for Docker.",
         "",
         "## Run sets",
         "",
