@@ -82,12 +82,10 @@ async function createUser(login, group) {
 
 const instructor = `${args.prefix}instructor`;
 await createUser(instructor, 'instructors');
-const tutors = Array.from({ length: Number(args.tutors) }, (_, index) => `${args.prefix}tutor${index + 1}`);
-await forEachLimited(tutors, PARALLEL, (login) => createUser(login, 'tutors'));
-const logins = Array.from({ length: students }, (_, index) => `${args.prefix}student${index + 1}`);
-await forEachLimited(logins, PARALLEL, (login) => createUser(login, 'students'));
-console.log(`course ${course.id}: 1 instructor, ${tutors.length} tutors, ${students} students`);
 
+// The text exercises come before the tutors and students: a released exercise notifies every member of the course, and
+// with thousands of students these notifications overflow the async task queue of the server, so that logins right after
+// it fail with HTTP 500 (seed of 2026-11-18 with 2000 students).
 const teacher = await new Client(args.server).login(instructor, args.password);
 async function createTextExercise(title) {
     const created = await teacher.post('/api/text/text-exercises', {
@@ -104,6 +102,12 @@ async function createTextExercise(title) {
 const textExercise = await createTextExercise('Control text exercise');
 const warmUpTextExercise = await createTextExercise('Warm-up text exercise');
 console.log(`text exercises ${textExercise} (control) and ${warmUpTextExercise} (warm-up): open until ${new Date(now + 365 * 864e5).toISOString()}`);
+
+const tutors = Array.from({ length: Number(args.tutors) }, (_, index) => `${args.prefix}tutor${index + 1}`);
+await forEachLimited(tutors, PARALLEL, (login) => createUser(login, 'tutors'));
+const logins = Array.from({ length: students }, (_, index) => `${args.prefix}student${index + 1}`);
+await forEachLimited(logins, PARALLEL, (login) => createUser(login, 'students'));
+console.log(`course ${course.id}: 1 instructor, ${tutors.length} tutors, ${students} students`);
 
 async function createQuiz(title, releaseDate, duration) {
     const { exercise, files } = createRequest({ title, releaseDate, duration: Number(duration) });
