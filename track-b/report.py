@@ -13,9 +13,13 @@ run's requests) and then summarized over runs: the median of the per-run values 
 side, a 95% percentile bootstrap interval over runs (D6, D38 rule 3); requests are never resampled. p99 is shown only if
 every run has at least 100 observations (D38 rule 4).
 
-A run set counts by its valid runs: with fewer than 5 valid runs per side it is a pilot or an incomplete attempt (D6),
-and the report says so; complete.json (judge.mjs) marks a complete set. Invalid runs are listed, never used as
-observations. Standard library only.
+A run has an outcome (judge.mjs, D44): valid, failed (the server failed the workload: evidence against the hypothesis,
+never a latency sample), or invalid (the measurement cannot be trusted). A run set is a result set only if complete.json
+exists, it has at least 5 repetitions, and every run is valid or failed (D6); a complete set with fewer repetitions is a
+complete pilot. Hypothesis verdicts (D16, D44) are given only for a result set of the targeted pair of the hypothesis
+(D37) at 2000 students; every other run set shows the same values as an illustration, without a verdict. H3 reads the
+statistics directly after the evaluation: the initial reads of Phase 2 (5 observations of the overview and the points
+page per run). Standard library only.
 """
 
 import argparse
@@ -38,6 +42,28 @@ PAGES = ["overview", "points", "question"]
 MIN_RUNS = 5  # D6
 MIN_P99 = 100  # D38 rule 4
 BOOTSTRAP = 10_000
+VERDICT_STUDENTS = 2000  # D16
+# D37: the targeted pair whose result set decides the hypothesis.
+HYPOTHESIS_PAIRS = {"H2": ("43bafcee17c", "f3463b75408"), "H3": ("c136826e299", "24a062759c2")}
+
+
+def commit_of(chain):
+    """The commit of the measured image of a side (artemis-thesis:<commit>)."""
+    return chain[-1].split(":")[-1] if chain else None
+
+
+def set_state(folder, parameters, runs):
+    """'result set', 'complete pilot', or 'incomplete', with a sentence for the report."""
+    complete = load(folder / "complete.json")
+    counts = {side: {outcome: sum(run.side == side and run.outcome == outcome for run in runs) for outcome in ("valid", "failed", "invalid")} for side in "AB"}
+    text = "; ".join(f"side {side}: {c['valid']} valid, {c['failed']} failed, {c['invalid']} invalid" for side, c in counts.items())
+    repetitions = parameters.get("repetitions") or 0
+    if complete and repetitions >= MIN_RUNS and all(c["invalid"] == 0 and c["valid"] + c["failed"] >= MIN_RUNS for c in counts.values()):
+        return "result set", f"**Result set** (complete.json, {repetitions} repetitions): {text}."
+    if complete:
+        return "complete pilot", (f"**Complete pilot** ({repetitions} repetition{'s' if repetitions != 1 else ''}, fewer than {MIN_RUNS}, D6): "
+                                  f"{text}. For orientation only; no result set and no verdict.")
+    return "incomplete", f"**Incomplete attempt** (no complete.json): {text}. For orientation only; no result set and no verdict."
 
 
 def load(path):
@@ -105,8 +131,13 @@ class Run:
         return result
 
     @property
+    def outcome(self):
+        # run.json before D44 has only valid.
+        return self.info.get("outcome") or ("valid" if self.info.get("valid") else "invalid")
+
+    @property
     def valid(self):
-        return bool(self.info.get("valid"))
+        return self.outcome == "valid"
 
     def reasons(self):
         if "reasons" in self.info:
@@ -269,21 +300,20 @@ def run_set_section(folder, label, rng):
     out.append(f"- Side A: `{' → '.join(parameters.get('sideA', []))}`")
     out.append(f"- Side B: `{' → '.join(parameters.get('sideB', []))}`")
     valid = {side: [run for run in side_runs[side] if run.valid] for side in "AB"}
-    complete = load(folder / "complete.json")
-    if complete:
-        out.append(f"- **Complete** (complete.json): {complete['validA']} and {complete['validB']} valid runs per side.")
-    elif min(len(valid["A"]), len(valid["B"])) < MIN_RUNS:
-        out.append(f"- **Pilot or incomplete attempt:** {len(valid['A'])} and {len(valid['B'])} valid runs per side, fewer than "
-                   f"{MIN_RUNS} (D6). The numbers are for orientation only; they are no result set.")
+    failed_runs = {side: [run for run in side_runs[side] if run.outcome == "failed"] for side in "AB"}
+    state, state_text = set_state(folder, parameters, runs)
+    out.append(f"- {state_text}")
     out.append("")
 
-    out += ["### Runs", "", "| Run | Measured | Valid | Reasons | Statistics | Phase 2 first request after evaluation | Submissions in time | Failed requests (control / Phase 1 / 2 / 3) |", "|---|---|---|---|---|---|---|---|"]
+    out += ["### Runs", "", "Outcome (judge.mjs, D44): valid; **failed**: the server failed the workload, kept as evidence and excluded "
+            "from the latency comparison; **invalid**: the measurement cannot be trusted.", "",
+            "| Run | Measured | Outcome | Reasons | Statistics | Phase 2 first request after evaluation | Submissions in time | Failed requests (control / Phase 1 / 2 / 3) |", "|---|---|---|---|---|---|---|---|"]
     for run in runs:
         delay = run.info.get("phase2FirstRequestDelayMillis", run.info.get("phase2DelayMillis"))
         submitted = count(run.phase1, "phase1_submitted_in_time")
         in_time = "–" if submitted is None else f"{submitted:.0f} of {parameters.get('students')}"
         failed = [count(summary, "http_req_failed", "passes") for summary in (run.control, run.phase1, run.phase2, run.phase3)]
-        out.append(f"| {run.name} | `{run.info.get('measured', '?')}` | {'yes' if run.valid else '**no**'} | {'; '.join(run.reasons()) or '–'} | "
+        out.append(f"| {run.name} | `{run.info.get('measured', '?')}` | {run.outcome if run.valid else f'**{run.outcome}**'} | {'; '.join(run.reasons()) or '–'} | "
                    f"{run.info.get('statisticsMode') or '–'} | {'–' if delay is None else f'{delay / 1000:.1f} s'} | "
                    f"{in_time} | "
                    f"{' / '.join('–' if value is None else f'{value:.0f}' for value in failed)} |")
@@ -371,10 +401,10 @@ def run_set_section(folder, label, rng):
             censored = fresh.get("censored", fresh.get("missing", 0))
             p95 = f"{'≥' if fresh.get('p95Censored') else ''}{ms(fresh['p95Millis'])}"
             rate = fresh.get("achievedPostRate")
-            state = "complete" if fresh.get("complete", True) else f"**incomplete:** {'; '.join(fresh['errors'])}"
+            measurement = "complete" if fresh.get("complete", True) else f"**incomplete:** {'; '.join(fresh['errors'])}"
             out.append(f"| {run.name} | {run.phase3_info.get('mode') or '–'} | {fresh['submissions']} | {fresh['values']} ({censored}) | "
                        f"{ms(fresh.get('minMillis'))} | {ms(fresh['medianMillis'])} | {p95} | {ms(fresh['p99Millis'])} | {ms(fresh['maxMillis'])} | {drain} | "
-                       f"{count(run.phase3, 'phase3_messages') or 0:.0f} | {'–' if rate is None else f'{rate:.2f}/s'} | {state} |")
+                       f"{count(run.phase3, 'phase3_messages') or 0:.0f} | {'–' if rate is None else f'{rate:.2f}/s'} | {measurement} |")
         out.append("")
 
     out += ["### Server, database, and k6", "",
@@ -419,9 +449,9 @@ def run_set_section(folder, label, rng):
     if has_phase2:
         has_initial = any(phase2_metric(run.phase2, "statistics-points", "initial") for run in runs)
         for type_ in PHASE2_TYPES:
-            metrics += stats_metrics(f"Phase 2 {type_} repeated", lambda run, t=type_: phase2_metric(run.phase2, t, "repeated"))
             if has_initial:
-                metrics.append((f"Phase 2 {type_} initial median (ms)", lambda run, t=type_: phase2_metric(run.phase2, t, "initial").get("med")))
+                metrics += stats_metrics(f"Phase 2 {type_} initial", lambda run, t=type_: phase2_metric(run.phase2, t, "initial"))
+            metrics += stats_metrics(f"Phase 2 {type_} repeated", lambda run, t=type_: phase2_metric(run.phase2, t, "repeated"))
     if has_phase3:
         metrics += stats_metrics("Phase 3 practice-submit", lambda run: trend(run.phase3, "http_req_duration{type:practice-submit}"))
         metrics.append(("Phase 3 freshness median (ms)", lambda run: (run.freshness or {}).get("medianMillis")))
@@ -436,37 +466,72 @@ def run_set_section(folder, label, rng):
         out.append(f"| {name} | {median_with_interval(per_side['A'], rng)} | {median_with_interval(per_side['B'], rng)} | {change} |")
     out.append("")
 
-    out += ["### Hypothesis checks (D16, D43)", "",
-            "Computed from the valid runs; an assessment only for a complete run set (pilots: illustration only). D16 sets the "
-            "bounds at 2000 students; at the other scales the rows describe scaling. Causal claims only from the targeted pair "
-            "of the hypothesis (D37): `f3463b75408` for H2, `24a062759c2` for H3; the end-to-end comparison shows version "
-            "differences. H2: ratio B/A of the per-run submit p95 with its 95% bootstrap interval; not worse if the upper limit "
-            "is at most 1.10. H3: upper limit of the 95% bootstrap interval of the per-run p95 on side B; a freshness p95 among "
-            "censored values counts as above the bound.", "",
-            "| Check | Value | Bound | Result |", "|---|---|---|---|"]
-    state = "" if (folder / "complete.json").exists() else " (pilot)"
+    out += ["### Hypothesis checks (D16, D44)", "",
+            f"A verdict only for a result set of the targeted pair of the hypothesis (D37: `43bafcee17c` → `f3463b75408` for H2, "
+            f"`c136826e299` → `24a062759c2` for H3) at {VERDICT_STUDENTS} students (D16). Every other run set shows the values "
+            "as an illustration, without a verdict; the end-to-end comparison shows version differences, not the effect of a "
+            "commit. A side B run that failed the workload counts against the hypothesis (D38 rule 1, D44); a side A failure "
+            "leaves it untested. H2: ratio B/A of the per-run submit p95 over the valid runs, 95% bootstrap interval; holds "
+            "if the upper limit is at most 1.10. H3 statistics: the initial reads of Phase 2, directly after the evaluation "
+            "(D16; each tutor's first round, 5 observations of the overview and the points page and 50 of the question pages "
+            "per run, so a per-run p95 of the overview is close to its maximum); upper limit of the 95% bootstrap interval of "
+            "the per-run p95 on side B. The repeated reads are in the table above and are not part of H3. H3 freshness: "
+            "the same for the per-run freshness p95; a p95 among censored values counts as above the bound.", "",
+            "| Check | Value (side B unless stated) | Observations per run | Bound | Result |", "|---|---|---|---|---|"]
+    students = parameters.get("students")
+    a_commit, b_commit = commit_of(parameters.get("sideA")), commit_of(parameters.get("sideB"))
+
+    def no_verdict(hypothesis):
+        """Why this run set gives no verdict for the hypothesis, or None."""
+        pair = HYPOTHESIS_PAIRS[hypothesis]
+        reasons = []
+        if (a_commit, b_commit) != pair:
+            reasons.append(f"not the {hypothesis} pair")
+        if students != VERDICT_STUDENTS:
+            reasons.append(f"{students} students, not {VERDICT_STUDENTS}")
+        if state != "result set":
+            reasons.append(state)
+        return f"no verdict ({', '.join(reasons)})" if reasons else None
+
+    def result(hypothesis, holds):
+        """The verdict cell: failures of side B decide first, then side A, then the bound (holds: True, False, or None)."""
+        verdict = no_verdict(hypothesis)
+        if verdict:
+            return verdict
+        if failed_runs["B"]:
+            return f"**fails**: side B failed the workload in {len(failed_runs['B'])} of {len(side_runs['B'])} runs"
+        if failed_runs["A"]:
+            return f"untested: side A failed the workload in {len(failed_runs['A'])} runs"
+        return "untested: fewer than two valid runs per side" if holds is None else ("holds" if holds else "**fails**")
+
+    failures = "; ".join(f"side {side} failed {len(failed_runs[side])} of {len(side_runs[side])}" for side in "AB" if failed_runs[side])
     submit = {side: [v for v in (trend(run.phase1, "http_req_duration{type:submit}").get("p(95)") for run in valid[side]) if v is not None] for side in "AB"}
     ratio = ratio_interval(submit["A"], submit["B"], rng)
-    if ratio:
-        out.append(f"| H2 submit p95 B/A | {ratio[0]:.3f} [{ratio[1]:.3f}, {ratio[2]:.3f}] | ≤ 1.10 | {'holds' if ratio[2] <= 1.10 else 'fails'}{state} |")
-    else:
-        out.append("| H2 submit p95 B/A | fewer than two valid runs per side | ≤ 1.10 | untested |")
+    value = f"{ratio[0]:.3f} [{ratio[1]:.3f}, {ratio[2]:.3f}]" if ratio else "fewer than two valid runs per side"
+    if failures:
+        value += f" ({failures})"
+    submits = [trend(run.phase1, "http_req_duration{type:submit}").get("count") for run in valid["B"]]
+    out.append(f"| H2 submit p95 B/A | {value} | {', '.join(f'{c:.0f}' for c in submits if c) or '–'} | ≤ 1.10 | "
+               f"{result('H2', None if not ratio else ratio[2] <= 1.10)} |")
     if has_phase2:
-        for type_ in PHASE2_TYPES:
-            if type_ == "statistics-footer":
-                continue
-            values = [v for v in (phase2_metric(run.phase2, type_, "repeated").get("p(95)") for run in valid["B"]) if v is not None]
+        for type_ in PHASE2_TYPES[:3]:
+            values = [trend(run.phase2, f"http_req_duration{{type:{type_},read:initial}}").get("p(95)") for run in valid["B"]]
+            values = [v for v in values if v is not None]
+            counts = sorted({trend(run.phase2, f"http_req_duration{{type:{type_},read:initial}}").get("count") for run in valid["B"]} - {None})
             high = bootstrap_high(values, rng)
-            out.append(f"| H3 {type_} p95, side B (ms) | {'fewer than two valid runs' if high is None else f'{high:.1f}'} | < 1000 | "
-                       f"{'untested' if high is None else ('holds' if high < 1000 else 'fails') + state} |")
+            cell = "no initial reads recorded" if not values else (f"{values[0]:.1f} (one run)" if high is None else f"{high:.1f}")
+            out.append(f"| H3 {type_} initial p95 (ms) | {cell} | {', '.join(f'{c:.0f}' for c in counts) or '–'} | < 1000 | "
+                       f"{result('H3', None if high is None else high < 1000)} |")
     if has_phase3:
         values = [(run.freshness or {}).get("p95Millis") for run in valid["B"]]
         censored = any((run.freshness or {}).get("p95Censored") for run in valid["B"])
         high = bootstrap_high([v for v in values if v is not None], rng)
-        result = "untested" if high is None else ("fails" if censored or high >= 2000 else "holds") + state
-        out.append(f"| H3 freshness p95, side B (ms) | {'fewer than two valid runs' if high is None else f'{high:.1f}'}{' (censored)' if censored else ''} | < 2000 | {result} |")
+        cell = ("–" if high is None else f"{high:.1f}") + (" (censored)" if censored else "")
+        counts = sorted({(run.freshness or {}).get("values") for run in valid["B"]} - {None})
+        out.append(f"| H3 freshness p95 (ms) | {cell} | {', '.join(str(c) for c in counts) or '–'} | < 2000 | "
+                   f"{result('H3', None if high is None else (not censored and high < 2000))} |")
     else:
-        out.append("| H3 freshness p95, side B (ms) | Phase 3 not run | < 2000 | untested (D38 rule 6) |")
+        out.append("| H3 freshness p95 (ms) | Phase 3 not run | – | < 2000 | untested (D38 rule 6) |")
     out.append("")
     return out, runs
 
@@ -490,9 +555,10 @@ def main():
         parameters = load(folder / "parameters.json") or {}
         phases = "1, 2, and 3" if any(run.phase3 for run in runs) else "1 and 2" if any(run.phase2 for run in runs) else "1"
         phases = f"control, {phases}" if any(run.control for run in runs) else phases
-        valid_runs = {side: sum(run.valid for run in runs if run.side == side) for side in "AB"}
-        state = "complete" if (folder / "complete.json").exists() else "pilot or incomplete"
-        overview.append(f"| {label} | {parameters.get('students')} | {phases} | {valid_runs['A']} / {valid_runs['B']} of {len(runs)} | {state} | "
+        counts = {side: {o: sum(run.side == side and run.outcome == o for run in runs) for o in ("valid", "failed", "invalid")} for side in "AB"}
+        state, _ = set_state(folder, parameters, runs)
+        cells = " | ".join(f"{c['valid']} / {c['failed']} / {c['invalid']}" for c in counts.values())
+        overview.append(f"| {label} | {parameters.get('students')} | {phases} | {cells} | {state} | "
                         f"`{str(parameters.get('toolRevision', ''))[:11]}` | {parameters.get('startedAt')} |")
 
     host = load(folders[-1] / "host.json") or {}
@@ -508,8 +574,8 @@ def main():
         "",
         "## Run sets",
         "",
-        "| Run set | Students | Phases | Valid runs A / B | State | Tool revision | Started |",
-        "|---|---|---|---|---|---|---|",
+        "| Run set | Students | Phases | Runs A: valid / failed / invalid | Runs B: valid / failed / invalid | State | Tool revision | Started |",
+        "|---|---|---|---|---|---|---|---|",
         *overview,
         "",
     ]

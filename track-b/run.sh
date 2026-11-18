@@ -37,12 +37,19 @@
 #  7. D19 semantics of the benchmark quiz (semantics.json). After Phase 3 they include the practice results (unrated
 #     statistics); after the control workflow, the submitted texts.
 #  8. Server log, tear down, delete the login cookies.
-# judge.mjs then writes run.json: the run is valid only if every k6 run passed its thresholds, both evaluations were
-# logged, the Phase 3 freshness measurement is complete, the running image and the server commit match the image, the
-# results equal the expected results of the deterministic answers, and the semantics equal those of the reference run
-# (the first run of the set that passed every other check). After the last run, judge.mjs writes complete.json only if
-# every side has REPETITIONS valid runs; run.sh then exits 0, else 1. parameters.json records the parameters, the SHA-256
-# of the seed files, and the image ids. runs.tsv lists all runs, valid or not.
+# judge.mjs then writes run.json with an outcome (D43, D44): valid (every check passed); failed (the measurement is
+# trustworthy but the server failed the workload: failed requests or submissions, no evaluation, wrong results; evidence
+# against the hypothesis, never a latency sample); or invalid (the measurement cannot be trusted: another image or other
+# container settings than planned, a k6 or tool error, the load generator behind schedule, an incomplete freshness
+# measurement). The reference of D19 is the first valid run. After the last run, judge.mjs writes complete.json only if
+# no run is invalid; run.sh then exits 0, else 1. runs.tsv lists all runs.
+#
+# Frozen inputs (D44): every image of both chains is resolved to its id once, at the start, and every server start
+# (migration and measurement) uses that id, never the tag. Compose reads no ambient configuration (lib/stack.sh). The
+# effective settings (lib/settings.sh: run parameters, k6 limits, resolved compose configuration), the SHA-256 of the
+# seed files, and the image ids go to parameters.json; each run records the settings of its running containers
+# (containers.json), and judge.mjs compares them with parameters.json. With CAMPAIGN=<inputs.json> (night.sh), run.sh
+# takes the image ids from that file and refuses to start if the tool revision, the seed hashes, or the settings differ.
 set -euo pipefail
 if ((BASH_VERSINFO[0] < 5)); then
     echo "run.sh needs Bash 5 or later (EPOCHREALTIME); this is $BASH_VERSION" >&2
@@ -54,6 +61,7 @@ project="trackb-run"
 source "$here/lib/stack.sh"
 source "$here/lib/k6-limits.sh"
 source "$here/lib/inputs.sh"
+source "$here/lib/settings.sh"
 
 seed="$(cd "$1" && pwd)"
 if [[ -e "$2" && -n "$(ls -A "$2")" ]]; then
@@ -64,19 +72,7 @@ out="$(mkdir -p "$2" && cd "$2" && pwd)"
 students="$3"
 IFS=, read -ra side_a <<<"$4"
 IFS=, read -ra side_b <<<"$5"
-repetitions="${REPETITIONS:-5}"
-warmup_students="${WARMUP_STUDENTS:-100}"
-rounds="${ROUNDS:-21}"
-warmup_rounds="${WARMUP_ROUNDS:-5}"
-schedule_seed="${SEED:-1}"
-settle="${SETTLE_SECONDS:-15}"
-sample_every="${SAMPLE_SECONDS:-5}"
-control="${CONTROL:-1}"
 phase3="${PHASE3:-1}"
-practice_rate="${PRACTICE_RATE:-10}"
-practice_seconds="${PRACTICE_SECONDS:-60}"
-drain="${DRAIN_SECONDS:-300}"
-export ARTEMIS_PORT="${ARTEMIS_PORT:-18080}"
 server="http://localhost:$ARTEMIS_PORT"
 manifest="$seed/manifest.json"
 
@@ -84,6 +80,8 @@ if ((students > $(jq '.students | length' "$manifest"))); then
     echo "the seed has $(jq '.students | length' "$manifest") students, not $students" >&2
     exit 2
 fi
+# The settings as configured, before the warm-up cohort is capped to the scale (the campaign freezes the configuration).
+settings="$(settings_json)"
 ((warmup_students <= students)) || warmup_students="$students"
 warmup_quiz="$(jq .warmUpQuiz "$manifest")"
 benchmark_quiz="$(jq .benchmarkQuiz "$manifest")"
@@ -93,23 +91,53 @@ if [[ "$control" == 1 ]] && ! jq -e '.warmUpTextExercise' "$manifest" >/dev/null
 fi
 
 "$here/check-host.sh" "$out/host.json"
-compose "${side_a[-1]}" config --format json >"$out/compose.json"
+seed_hash_json="$(seed_hashes "$seed")"
+tool_revision="$(git -C "$here" rev-parse HEAD)$(git -C "$here" diff --quiet HEAD -- . || echo '-dirty')"
+declare -A image_id=()
+campaign_json=null
+if [[ -n "${CAMPAIGN:-}" ]]; then
+    # A campaign run set uses exactly the frozen inputs of night.sh.
+    problems=()
+    [[ "$tool_revision" == "$(jq -r .toolRevision "$CAMPAIGN")" ]] || problems+=("tool revision $tool_revision")
+    jq -e --argjson seed "$seed_hash_json" '.seed == $seed' "$CAMPAIGN" >/dev/null || problems+=("seed hashes")
+    jq -e --argjson settings "$settings" '.settings == $settings' "$CAMPAIGN" >/dev/null || problems+=("settings")
+    for image in "${side_a[@]}" "${side_b[@]}"; do
+        image_id[$image]="$(jq -r --arg image "$image" '.images[$image] // ""' "$CAMPAIGN")"
+        [[ -n "${image_id[$image]}" ]] || problems+=("no frozen id for $image")
+    done
+    if ((${#problems[@]} > 0)); then
+        printf 'the inputs differ from the campaign %s: %s\n' "$CAMPAIGN" "${problems[*]}" >&2
+        exit 2
+    fi
+    campaign_json="$(jq -n --arg file "$(cd "$(dirname "$CAMPAIGN")" && pwd)/$(basename "$CAMPAIGN")" --arg sha256 "$(sha256 "$CAMPAIGN")" '$ARGS.named')"
+else
+    for image in "${side_a[@]}" "${side_b[@]}"; do
+        image_id[$image]="$(docker image inspect "$image" --format '{{.Id}}' 2>/dev/null || true)"
+        if [[ -z "${image_id[$image]}" ]]; then
+            echo "image $image is missing" >&2
+            exit 2
+        fi
+    done
+fi
+images_json="$(for image in "${!image_id[@]}"; do jq -n --arg k "$image" --arg v "${image_id[$image]}" '{($k): $v}'; done | jq -s add)"
+compose "${image_id[${side_a[-1]}]}" config --format json >"$out/compose.json"
 jq -n --arg seed "$seed" --argjson students "$students" --argjson repetitions "$repetitions" \
     --argjson warmUpStudents "$warmup_students" --argjson scheduleSeed "$schedule_seed" --argjson settleSeconds "$settle" \
     --argjson rounds "$rounds" --argjson warmUpRounds "$warmup_rounds" --argjson phase3 "$([[ "$phase3" == 1 ]] && echo true || echo false)" \
     --argjson control "$([[ "$control" == 1 ]] && echo true || echo false)" \
     --argjson practiceRate "$practice_rate" --argjson practiceSeconds "$practice_seconds" --argjson drainSeconds "$drain" \
     --argjson sampleSeconds "$sample_every" --arg k6Cpuset "$K6_CPUSET" --arg k6Memory "$K6_MEMORY" \
-    --arg toolRevision "$(git -C "$here" rev-parse HEAD)$(git -C "$here" diff --quiet HEAD -- . || echo '-dirty')" \
+    --arg toolRevision "$tool_revision" \
     --arg startedAt "$(date -u +%FT%TZ)" --arg order "balanced: odd repetitions A then B, even repetitions B then A" \
-    --argjson seedHashes "$(seed_hashes "$seed")" --argjson images "$(image_ids "${side_a[@]}" "${side_b[@]}")" \
+    --argjson seedHashes "$seed_hash_json" --argjson images "$images_json" --argjson settings "$settings" \
+    --argjson campaign "$campaign_json" \
     '$ARGS.named + {sideA: $ARGS.positional[0] | split(","), sideB: $ARGS.positional[1] | split(",")}' \
     --args "$4" "$5" >"$out/parameters.json"
 
 sampler_pid=""
 cleanup() {
     [[ -z "$sampler_pid" ]] || kill "$sampler_pid" 2>/dev/null || true
-    compose "${side_a[-1]}" down -v --remove-orphans >/dev/null 2>&1 || true
+    compose "${image_id[${side_a[-1]}]}" down -v --remove-orphans >/dev/null 2>&1 || true
     find "$out" -name sessions.json -delete
 }
 trap cleanup EXIT
@@ -177,34 +205,47 @@ sample() {
     done
 }
 
-# measure <repetition> <side> <images...>
+# container_facts <image-id>: the settings of the running Artemis and PostgreSQL containers (containers.json): image id,
+# CPU set, memory limits, and environment, for judge.mjs to compare with the frozen compose configuration.
+container_facts() {
+    local service
+    for service in artemis postgres; do
+        docker inspect "$(compose "$1" ps -q "$service")" | jq -c --arg service "$service" '.[0] | {service: $service,
+            image: .Image, cpuset: .HostConfig.CpusetCpus, memory: .HostConfig.Memory, memorySwap: .HostConfig.MemorySwap,
+            env: (.Config.Env | map(capture("^(?<k>[^=]*)=(?<v>.*)$")) | from_entries)}'
+    done | jq -s .
+}
+
+# measure <repetition> <side> <images...>: the images are tags; every server starts by the frozen id (image_id).
 measure() {
     local repetition="$1" side="$2"
     shift 2
     local images=("$@") dir="$out/$repetition-$side"
     local measured="${images[-1]}" image start evaluated=true semantics_exit=0
+    local measured_id="${image_id[${images[-1]}]}"
     local warmup_control_exit=0 warmup_phase1_exit=0 warmup_phase2_exit=0 warmup_phase3_exit=0 warmup_freshness_exit=0
     local control_exit=0 phase1_exit=0 phase2_exit=0 phase3_exit=0 freshness_exit=0
     mkdir -p "$dir"
 
     log "run $repetition-$side: restore, start ${images[*]}"
-    restore_seed "${images[0]}" "$seed"
+    restore_seed "${image_id[${images[0]}]}" "$seed"
     : >"$dir/starts.txt"
     for image in "${images[@]}"; do
         start=$SECONDS
-        compose "$image" up -d --wait --wait-timeout 1800 artemis >/dev/null 2>&1
-        echo "migrate $image $((SECONDS - start))" >>"$dir/starts.txt"
-        compose "$image" stop artemis >/dev/null 2>&1
+        compose "${image_id[$image]}" up -d --wait --wait-timeout 1800 artemis >/dev/null 2>&1
+        echo "migrate $image ${image_id[$image]} $((SECONDS - start))" >>"$dir/starts.txt"
+        compose "${image_id[$image]}" stop artemis >/dev/null 2>&1
     done
     start=$SECONDS
-    compose "$measured" up -d --wait --wait-timeout 1800 artemis >/dev/null 2>&1
-    echo "measure $measured $((SECONDS - start))" >>"$dir/starts.txt"
+    compose "$measured_id" up -d --wait --wait-timeout 1800 artemis >/dev/null 2>&1
+    echo "measure $measured $measured_id $((SECONDS - start))" >>"$dir/starts.txt"
     for image in "${images[@]}"; do
-        docker image inspect "$image" --format '{{json .}}' | jq -c --arg image "$image" \
+        docker image inspect "${image_id[$image]}" --format '{{json .}}' | jq -c --arg image "$image" \
             '{image: $image, id: .Id, commit: .Config.Labels["thesis.commit"], head: .Config.Labels["thesis.head"]}'
     done | jq -s . >"$dir/images.json"
+    container_facts "$measured_id" >"$dir/containers.json"
     local running_image
-    running_image="$(docker inspect --format '{{.Image}}' "$(compose "$measured" ps -q artemis)")"
+    running_image="$(jq -r '.[] | select(.service == "artemis") | .image' "$dir/containers.json")"
     curl -sf "$server/management/info" | jq '{version: .build.version, commit: .git.commit.id.full}' >"$dir/info.json"
 
     node "$here/login.mjs" --manifest "$manifest" --server "$server" --students "$students" --out "$dir/sessions.json"
@@ -219,7 +260,7 @@ measure() {
     fi
     "$here/k6.sh" "$project" phase1.js "$dir/warm-up/phase1" -e QUIZ=warmUp -e STUDENTS="$warmup_students" -e SEED="$schedule_seed" \
         >"$dir/warm-up/phase1/k6.log" 2>&1 || warmup_phase1_exit=$?
-    wait_for_evaluation "$measured" "$warmup_quiz" "$dir/warm-up/evaluation.txt" || evaluated=false
+    wait_for_evaluation "$measured_id" "$warmup_quiz" "$dir/warm-up/evaluation.txt" || evaluated=false
     cp "$dir/warm-up/phase1/questions.json" "$dir/warm-up/phase2/" 2>/dev/null || true
     "$here/k6.sh" "$project" phase2.js "$dir/warm-up/phase2" -e QUIZ=warmUp -e STUDENTS="$warmup_students" \
         -e ROUNDS="$warmup_rounds" -e SEED="$schedule_seed" >"$dir/warm-up/phase2/k6.log" 2>&1 || warmup_phase2_exit=$?
@@ -229,35 +270,35 @@ measure() {
     sleep "$settle"
 
     # Errors of single samples (for example a container that exits during docker stats) go to sampler.log.
-    sample "$measured" "$dir" 2>>"$dir/sampler.log" &
+    sample "$measured_id" "$dir" 2>>"$dir/sampler.log" &
     sampler_pid=$!
     if [[ "$control" == 1 ]]; then
         log "run $repetition-$side: control workflow, $students students"
-        pg_stat "$measured" >"$dir/pg-stat-before-control.csv"
-        compose "$measured" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-before-control.txt"
+        pg_stat "$measured_id" >"$dir/pg-stat-before-control.csv"
+        compose "$measured_id" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-before-control.txt"
         "$here/k6.sh" "$project" control.js "$dir/control" -e EXERCISE=benchmark -e SEED="$schedule_seed" \
             >"$dir/control/k6.log" 2>&1 || control_exit=$?
         sleep "$settle"
     fi
     log "run $repetition-$side: Phase 1, $students students"
-    pg_stat "$measured" >"$dir/pg-stat-before.csv"
-    compose "$measured" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-before.txt"
+    pg_stat "$measured_id" >"$dir/pg-stat-before.csv"
+    compose "$measured_id" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-before.txt"
     "$here/k6.sh" "$project" phase1.js "$dir/phase1" -e QUIZ=benchmark -e SEED="$schedule_seed" \
         >"$dir/phase1/k6.log" 2>&1 || phase1_exit=$?
-    wait_for_evaluation "$measured" "$benchmark_quiz" "$dir/evaluation.txt" || evaluated=false
+    wait_for_evaluation "$measured_id" "$benchmark_quiz" "$dir/evaluation.txt" || evaluated=false
     log "run $repetition-$side: Phase 2, $rounds statistics rounds"
     cp "$dir/phase1/questions.json" "$dir/phase2/" 2>/dev/null || true
     "$here/k6.sh" "$project" phase2.js "$dir/phase2" -e QUIZ=benchmark -e STUDENTS="$students" -e ROUNDS="$rounds" \
         -e SEED="$schedule_seed" >"$dir/phase2/k6.log" 2>&1 || phase2_exit=$?
     sleep "$settle"
-    pg_stat "$measured" >"$dir/pg-stat-after.csv"
-    compose "$measured" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-after.txt"
+    pg_stat "$measured_id" >"$dir/pg-stat-after.csv"
+    compose "$measured_id" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-after.txt"
     if [[ "$phase3" == 1 ]]; then
         log "run $repetition-$side: Phase 3, $practice_rate practice submissions per second for at most $practice_seconds s"
         run_phase3 "$dir/phase3" benchmark "$students" phase3_exit freshness_exit
         sleep "$settle"
-        pg_stat "$measured" >"$dir/pg-stat-after-phase3.csv"
-        compose "$measured" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-after-phase3.txt"
+        pg_stat "$measured_id" >"$dir/pg-stat-after-phase3.csv"
+        compose "$measured_id" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-after-phase3.txt"
     fi
     touch "$dir/.stop"
     wait "$sampler_pid" || true
@@ -268,8 +309,8 @@ measure() {
     log "run $repetition-$side: semantics"
     node "$here/semantics.mjs" --manifest "$manifest" --server "$server" --quiz benchmark --students "$students" \
         --out "$dir/semantics.json" || semantics_exit=$?
-    compose "$measured" logs artemis >"$dir/server.log" 2>&1
-    compose "$measured" down -v >/dev/null 2>&1
+    compose "$measured_id" logs artemis >"$dir/server.log" 2>&1
+    compose "$measured_id" down -v >/dev/null 2>&1
     find "$dir" -name sessions.json -delete
 
     jq -n --argjson repetition "$repetition" --arg side "$side" --arg measured "$measured" --arg runningImageId "$running_image" \
@@ -296,7 +337,7 @@ for repetition in $(seq "$repetitions"); do
 done
 
 {
-    printf 'run\tmeasured\tvalid\tcontrol-submit p95 ms\tstart-participation p95 ms\tsave p95 ms\tsubmit p95 ms\tevaluation ms\tstatistics\toverview p95 ms\tpoints p95 ms\tquestion p95 ms\tpractice-submit p95 ms\tfreshness p95 ms\n'
+    printf 'run\tmeasured\toutcome\tcontrol-submit p95 ms\tstart-participation p95 ms\tsave p95 ms\tsubmit p95 ms\tevaluation ms\tstatistics\toverview p95 ms\tpoints p95 ms\tquestion p95 ms\tpractice-submit p95 ms\tfreshness p95 ms\n'
     for run in $(seq "$repetitions"); do
         for side in A B; do
             dir="$out/$run-$side"
@@ -312,7 +353,7 @@ done
                 --slurpfile p2 "$phase2" --slurpfile p3 "$phase3" '
                 def round1: if . == null then "-" else (. * 10 | round / 10 | tostring) end;
                 def p95($summary; $type): $summary[0].metrics["http_req_duration{type:\($type)}"].values["p(95)"] // null | round1;
-                [$run, $r[0].measured, ($r[0].valid | tostring), p95($c; "control-submit"), p95($p1; "start-participation"), p95($p1; "save"),
+                [$run, $r[0].measured, ($r[0].outcome // ($r[0].valid | tostring)), p95($c; "control-submit"), p95($p1; "start-participation"), p95($p1; "save"),
                     p95($p1; "submit"), ($r[0].evaluationMillis // "-" | tostring), ($r[0].statisticsMode // "-"),
                     p95($p2; "statistics-overview,read:repeated"), p95($p2; "statistics-points,read:repeated"), p95($p2; "statistics-question,read:repeated"),
                     p95($p3; "practice-submit"), ($r[0].freshnessP95Millis | round1)] | @tsv'

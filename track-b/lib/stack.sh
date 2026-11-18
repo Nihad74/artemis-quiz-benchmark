@@ -2,11 +2,23 @@
 # Shared shell functions of the Track B scripts. Source it after setting `here` (the track_b folder) and `project` (the
 # compose project name).
 
-# compose <image> <docker compose arguments...>: docker compose for the server image <image>.
+# compose_cli <docker compose arguments...>: docker compose without ambient configuration. No COMPOSE_* variable (for
+# example COMPOSE_ENV_FILES or COMPOSE_FILE) and no .env file reaches compose (--env-file /dev/null), so the settings come
+# only from compose.yml and the exported variables that it names; run.sh freezes the resolved result (lib/settings.sh).
+compose_cli() {
+    local name unset=()
+    for name in "${!COMPOSE_@}"; do
+        unset+=(-u "$name")
+    done
+    env "${unset[@]}" docker compose --env-file /dev/null "$@"
+}
+
+# compose <image> <docker compose arguments...>: docker compose for the server image <image>. Pass the image id
+# (sha256:...), not a tag: a tag can move between the start of a run set and a server start.
 compose() {
     local image="$1"
     shift
-    ARTEMIS_IMAGE="$image" docker compose -p "$project" -f "$here/compose.yml" "$@"
+    ARTEMIS_IMAGE="$image" compose_cli -p "$project" -f "$here/compose.yml" "$@"
 }
 
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }

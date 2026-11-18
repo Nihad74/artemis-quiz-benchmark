@@ -1,22 +1,29 @@
 #!/usr/bin/env node
 /**
- * Validity of Track B runs (D19, D38, D42) and completion of a run set. Called by run.sh; no server needed.
+ * Validity of Track B runs (D19, D38, D42, D43, D44) and completion of a run set. Called by run.sh; no server needed.
  *
  *   node judge.mjs run <out> <run-folder>
  *     Writes <run-folder>/run.json from exits.json (k6 exit statuses and flags, written by run.sh) and the artifacts of the
- *     run. A run is valid only if
- *       - every k6 run passed its thresholds and both evaluations were logged (workload),
- *       - the Phase 3 freshness measurement is complete (phase3/freshness.json, if Phase 3 ran),
- *       - the running container uses the recorded image and the server reports the commit of its label (provenance),
- *       - the student scores and the point statistic equal the results that the deterministic answers must produce
- *         (lib/expected.mjs), independent of any other run,
- *       - and its semantics equal those of the reference run of the run set (D19, D38 rule 7).
- *     The reference is the first run, in run order, that passes all other checks: <out>/reference.json names it. A run
- *     before the reference exists cannot be valid without passing the same checks, so no run is compared with a failed
+ *     run, with an outcome:
+ *       invalid  the measurement cannot be trusted: the running container is not the image id frozen in parameters.json,
+ *                its settings differ from the frozen compose configuration, the server reports another commit, a k6 run
+ *                ended with an error (exit status other than 0 and 99) or without a summary, a load-generator threshold
+ *                failed (dropped iterations, practice POSTs behind schedule), a threshold this file does not know failed,
+ *                the freshness measurement is incomplete, or the semantics could not be recorded;
+ *       failed   the measurement is trustworthy, but the server failed the workload: a server-outcome threshold failed
+ *                (failed requests or checks, submissions not answered in time, results not received, pages not loaded,
+ *                practice submissions not answered), the evaluation was not logged, or the results differ from the
+ *                expected results or from the reference. Evidence against the hypothesis (D38 rule 1, D44), never a
+ *                latency sample;
+ *       valid    every check passed.
+ *     The expected results come from the deterministic answers (lib/expected.mjs), independent of any other run. The
+ *     reference of D19 is the first valid run in run order (<out>/reference.json), so no run is compared with a failed
  *     or missing reference.
  *
  *   node judge.mjs complete <out> <repetitions>
- *     Writes <out>/complete.json (atomically) only if every side has <repetitions> valid runs; exit status 1 otherwise.
+ *     Writes <out>/complete.json (atomically) only if every side has <repetitions> runs and none is invalid: each run is
+ *     either a valid measurement or a failure of the server. Exit status 1 otherwise. A result set additionally needs 5
+ *     repetitions (D6); night.sh and report.py check that.
  */
 import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { expectedResultErrors } from './lib/expected.mjs';
@@ -47,48 +54,134 @@ function normalized(semantics) {
     return canonical(rest);
 }
 
+/** k6 thresholds whose failure means the server did not serve the workload. Any other failed threshold makes the run invalid. */
+const SERVER_THRESHOLDS = new Set([
+    'checks',
+    'http_req_failed',
+    'control_students_complete',
+    'phase1_submitted_in_time',
+    'phase1_failed_students',
+    'phase1_results_received',
+    'phase1_result_subscribed_late',
+    'phase2_pages_loaded',
+    'phase3_practice_answered',
+]);
+const K6_RUNS = {
+    warmUpControlExit: 'warm-up/control',
+    controlExit: 'control',
+    warmUpPhase1Exit: 'warm-up/phase1',
+    phase1Exit: 'phase1',
+    warmUpPhase2Exit: 'warm-up/phase2',
+    phase2Exit: 'phase2',
+    warmUpPhase3Exit: 'warm-up/phase3',
+    phase3Exit: 'phase3',
+};
+
+/** Names of the metrics with a failed threshold in a k6 summary. */
+function failedThresholds(summary) {
+    return Object.entries(summary?.metrics ?? {})
+        .filter(([, metric]) => Object.values(metric.thresholds ?? {}).some((threshold) => threshold.ok === false))
+        .map(([name]) => name);
+}
+
+/** Differences between the running containers (containers.json) and the frozen compose configuration. */
+function containerDifferences(containers, compose, plannedId) {
+    const differences = [];
+    for (const service of ['artemis', 'postgres']) {
+        const planned = compose?.services?.[service];
+        const running = containers?.find((container) => container.service === service);
+        if (!planned || !running) {
+            differences.push(`${service}: no ${planned ? 'container facts' : 'frozen configuration'}`);
+            continue;
+        }
+        if (service === 'artemis' && running.image !== plannedId) {
+            differences.push(`artemis image ${running.image}, planned ${plannedId}`);
+        }
+        if (running.cpuset !== planned.cpuset) {
+            differences.push(`${service} CPU set ${running.cpuset}, planned ${planned.cpuset}`);
+        }
+        if (String(running.memory) !== String(planned.mem_limit) || String(running.memorySwap) !== String(planned.memswap_limit)) {
+            differences.push(`${service} memory ${running.memory}/${running.memorySwap}, planned ${planned.mem_limit}/${planned.memswap_limit}`);
+        }
+        for (const [key, value] of Object.entries(planned.environment ?? {})) {
+            if ((running.env ?? {})[key] !== String(value ?? '')) {
+                differences.push(`${service} ${key}=${running.env?.[key]}, planned ${value}`);
+            }
+        }
+    }
+    return differences;
+}
+
 function judgeRun(out, dir) {
     const exits = read(`${dir}/exits.json`);
     const parameters = read(`${out}/parameters.json`);
     const manifest = read(`${parameters.seed}/manifest.json`);
-    const reasons = [];
+    const measurement = [];
+    const server = [];
 
-    const exitNames = Object.keys(exits).filter((key) => key.endsWith('Exit'));
-    for (const name of exitNames) {
-        if (exits[name] !== 0) {
-            reasons.push(`${name} ${exits[name]}`);
+    for (const [name, status] of Object.entries(exits).filter(([key]) => key.endsWith('Exit'))) {
+        if (status === 0) {
+            continue;
+        }
+        const folder = K6_RUNS[name];
+        if (!folder) {
+            // freshness.mjs and semantics.mjs: the measurement itself failed.
+            measurement.push(`${name} ${status}`);
+            continue;
+        }
+        const summary = read(`${dir}/${folder}/summary.json`);
+        if (status !== 99 || !summary) {
+            measurement.push(`${name} ${status}${summary ? '' : ' without summary'}`);
+            continue;
+        }
+        const failed = failedThresholds(summary);
+        const serverFailed = failed.filter((metric) => SERVER_THRESHOLDS.has(metric.split('{')[0]));
+        const otherFailed = failed.filter((metric) => !serverFailed.includes(metric));
+        if (serverFailed.length) {
+            server.push(`${name}: ${serverFailed.join(', ')}`);
+        }
+        if (otherFailed.length || !failed.length) {
+            measurement.push(`${name}: ${otherFailed.length ? otherFailed.join(', ') : 'no failed threshold recorded'}`);
         }
     }
     if (!exits.evaluated) {
-        reasons.push('evaluation not logged');
+        server.push('evaluation not logged');
     }
 
     const freshness = read(`${dir}/phase3/freshness.json`);
     if (exits.phase3Run && !freshness) {
-        reasons.push('no freshness measurement');
+        measurement.push('no freshness measurement');
     } else if (exits.phase3Run && !freshness.complete) {
-        reasons.push(`freshness measurement incomplete: ${freshness.errors.join('; ')}`);
+        measurement.push(`freshness measurement incomplete: ${freshness.errors.join('; ')}`);
     }
 
+    // Provenance against the inputs frozen at the start of the run set (D44), not against a later look at a tag.
+    const plannedId = parameters.images?.[exits.measured];
     const images = read(`${dir}/images.json`) ?? [];
     const measuredImage = images.find((image) => image.image === exits.measured);
     const info = read(`${dir}/info.json`);
-    if (!measuredImage || measuredImage.id !== exits.runningImageId) {
-        reasons.push(`running image ${exits.runningImageId} is not ${exits.measured} (${measuredImage?.id})`);
+    if (!plannedId) {
+        measurement.push(`no frozen image id for ${exits.measured} in parameters.json`);
+    } else if (exits.runningImageId !== plannedId || measuredImage?.id !== plannedId) {
+        measurement.push(`running image ${exits.runningImageId} is not the frozen id ${plannedId} of ${exits.measured}`);
     }
     if (!measuredImage?.head || !info?.commit?.startsWith(measuredImage.head)) {
-        reasons.push(`server commit ${info?.commit} is not the image label ${measuredImage?.head}`);
+        measurement.push(`server commit ${info?.commit} is not the image label ${measuredImage?.head}`);
+    }
+    const differences = containerDifferences(read(`${dir}/containers.json`), parameters.settings?.compose, plannedId);
+    if (differences.length) {
+        measurement.push(`containers differ from the frozen settings: ${differences.join('; ')}`);
     }
 
     const semantics = read(`${dir}/semantics.json`);
     const phase3 = read(`${dir}/phase3/phase3.json`);
     let expectedErrors = null;
     if (!semantics) {
-        reasons.push('no semantics');
+        measurement.push('no semantics');
     } else {
         expectedErrors = expectedResultErrors(semantics, manifest.students, parameters.students, exits.phase3Run ? (phase3?.submissions ?? 0) : 0);
         if (expectedErrors.length) {
-            reasons.push(`results differ from the expected results: ${expectedErrors.length} differences, first: ${expectedErrors[0]}`);
+            server.push(`results differ from the expected results: ${expectedErrors.length} differences, first: ${expectedErrors[0]}`);
         }
     }
 
@@ -96,16 +189,18 @@ function judgeRun(out, dir) {
     const name = dir.split('/').at(-1);
     let reference = read(`${out}/reference.json`);
     let semanticsEqual = null;
-    if (reasons.length === 0) {
+    if (measurement.length === 0 && server.length === 0) {
         if (!reference) {
             reference = { run: name };
             writeAtomic(`${out}/reference.json`, reference);
         }
         semanticsEqual = reference.run === name || normalized(semantics) === normalized(read(`${out}/${reference.run}/semantics.json`));
         if (!semanticsEqual) {
-            reasons.push(`semantics differ from the reference run ${reference.run}`);
+            server.push(`semantics differ from the reference run ${reference.run}`);
         }
     }
+    const outcome = measurement.length ? 'invalid' : server.length ? 'failed' : 'valid';
+    const reasons = [...measurement, ...server];
 
     const evaluation = existsSync(`${dir}/evaluation.txt`) ? readFileSync(`${dir}/evaluation.txt`, 'utf8') : '';
     const evaluationMillis = Number(evaluation.match(/durationMillis=(\d+)/)?.[1] ?? NaN);
@@ -116,6 +211,7 @@ function judgeRun(out, dir) {
     const phase1 = read(`${dir}/phase1/summary.json`)?.metrics?.phase1_time_to_result?.values;
     const run = {
         ...exits,
+        plannedImageId: plannedId ?? null,
         evaluationMillis: Number.isFinite(evaluationMillis) ? evaluationMillis : null,
         evaluationEnd: Number.isFinite(evaluationEnd) ? evaluationEnd : null,
         statisticsMode: phase2?.mode ?? null,
@@ -129,20 +225,32 @@ function judgeRun(out, dir) {
         expectedResults: expectedErrors === null ? null : expectedErrors.length === 0,
         reference: reference?.run ?? null,
         semanticsEqual,
+        measurementReasons: measurement,
+        serverReasons: server,
         reasons,
-        valid: reasons.length === 0,
+        outcome,
+        valid: outcome === 'valid',
     };
     writeAtomic(`${dir}/run.json`, run);
-    console.log(JSON.stringify({ run: name, valid: run.valid, reasons }));
+    console.log(JSON.stringify({ run: name, outcome, reasons }));
 }
 
 function judgeComplete(out, repetitions) {
     const runs = readdirSync(out)
         .filter((name) => /^\d+-[AB]$/.test(name))
         .map((name) => ({ name, side: name.split('-')[1], run: read(`${out}/${name}/run.json`) }));
-    const valid = Object.fromEntries(['A', 'B'].map((side) => [side, runs.filter((entry) => entry.side === side && entry.run?.valid).length]));
-    const complete = valid.A >= repetitions && valid.B >= repetitions;
-    const state = { repetitions, validA: valid.A, validB: valid.B, runs: runs.length, invalid: runs.filter((entry) => !entry.run?.valid).map((entry) => entry.name) };
+    const count = (side, outcome) => runs.filter((entry) => entry.side === side && (entry.run?.outcome ?? 'invalid') === outcome).length;
+    const state = {
+        repetitions,
+        validA: count('A', 'valid'),
+        failedA: count('A', 'failed'),
+        validB: count('B', 'valid'),
+        failedB: count('B', 'failed'),
+        runs: runs.length,
+        invalid: runs.filter((entry) => (entry.run?.outcome ?? 'invalid') === 'invalid').map((entry) => entry.name),
+    };
+    const complete =
+        state.invalid.length === 0 && state.validA + state.failedA >= repetitions && state.validB + state.failedB >= repetitions;
     console.log(JSON.stringify({ complete, ...state }));
     if (!complete) {
         process.exit(1);

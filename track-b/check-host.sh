@@ -13,6 +13,7 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 source "$here/lib/k6-limits.sh"
+source "$here/lib/stack.sh"
 k6_cpuset="$K6_CPUSET"
 k6_memory="$K6_MEMORY"
 vm_reserve="${VM_RESERVE:-1g}"
@@ -42,7 +43,7 @@ cpus() {
     echo "${out[@]}"
 }
 
-config="$(ARTEMIS_IMAGE=check docker compose -f "$here/compose.yml" config --format json)"
+config="$(ARTEMIS_IMAGE=check compose_cli -f "$here/compose.yml" config --format json)"
 artemis_cpuset="$(jq -r '.services.artemis.cpuset' <<<"$config")"
 postgres_cpuset="$(jq -r '.services.postgres.cpuset' <<<"$config")"
 artemis_memory="$(jq -r '.services.artemis.mem_limit' <<<"$config")"

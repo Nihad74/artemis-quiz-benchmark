@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# Regression checks of the Track B run validity, completion, input freeze, and freshness measurement. No server is
-# started; the checks use fixtures and the semantics of the pilot of 2026-11-17 at 2000 students, whose run 1-A missed one
-# submission. Needs Bash 5, Node 24, jq, Docker (night.sh reads image ids), and the pilot folder
-# (PILOT, default ~/Documents/thesis-benchmark-results/track-b/pilot-mac-2026-11-17).
+# Regression checks of the Track B run outcomes, completion, frozen inputs, report verdicts, and freshness measurement.
+# No server is started; the checks use fixtures and saved pilots: the pilot of 2026-11-17 at 2000 students (run 1-A
+# missed one submission) and the final pilots of 2026-11-18 (the f3463b75408 run failed the workload). Needs Bash 5,
+# Node 24, jq, Python 3, Docker (image ids, compose config), and the pilot folders under RESULTS_ROOT (default
+# ~/Documents/thesis-benchmark-results/track-b). The night.sh and run.sh campaign checks need a committed track-b/.
 #
 # Usage: test/checks.sh
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
-pilot="${PILOT:-$HOME/Documents/thesis-benchmark-results/track-b/pilot-mac-2026-11-17}"
+root="${RESULTS_ROOT:-$HOME/Documents/thesis-benchmark-results/track-b}"
+pilot="$root/pilot-mac-2026-11-17"
+final="$root/pilot-mac-2026-11-18-final"
+seed="$root/seed-2000-2026-11-18"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 failures=0
@@ -18,6 +22,14 @@ fail() {
     failures=$((failures + 1))
 }
 expect() { if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1 (got '$2', expected '$3')"; fi; }
+exists() { [[ -e "$1" ]] && echo yes || echo no; }
+committed() { git -C "$here" diff --quiet HEAD -- .; }
+
+# The frozen compose settings of the fixtures, and running containers that match them.
+settings='{"compose":{"services":{"artemis":{"cpuset":"0-5","mem_limit":"100","memswap_limit":"100","environment":{"POOL":"100"}},
+    "postgres":{"cpuset":"6-9","mem_limit":"50","memswap_limit":"50","environment":{"POSTGRES_USER":"Artemis"}}}}}'
+containers='[{"service":"artemis","image":"sha256:abc","cpuset":"0-5","memory":100,"memorySwap":100,"env":{"POOL":"100","PATH":"/bin"}},
+    {"service":"postgres","image":"sha256:pg","cpuset":"6-9","memory":50,"memorySwap":50,"env":{"POSTGRES_USER":"Artemis"}}]'
 
 # A run folder for judge.mjs: valid workload and provenance, with the semantics of a pilot run.
 make_run() {
@@ -26,6 +38,7 @@ make_run() {
     cp "$semantics" "$out/$name/semantics.json"
     echo '[{"image":"artemis-thesis:x","id":"sha256:abc","head":"83f5370b5d7"}]' >"$out/$name/images.json"
     echo '{"version":"9.9","commit":"83f5370b5d7cee936e6e961d4a5420743144c2b8"}' >"$out/$name/info.json"
+    echo "$containers" >"$out/$name/containers.json"
     echo '2026-11-17T15:50:00.000Z INFO Thesis benchmark: calculateAllResults quiz=4 participations=2000 durationMillis=1000' >"$out/$name/evaluation.txt"
     jq -n --arg side "${name#*-}" --argjson phase1Exit "$exit_status" '{repetition: 1, side: $side, measured: "artemis-thesis:x",
         runningImageId: "sha256:abc", warmUpPhase1Exit: 0, phase1Exit: $phase1Exit, phase2Exit: 0, semanticsExit: 0,
@@ -34,8 +47,18 @@ make_run() {
 
 new_set() {
     mkdir -p "$1"
-    jq -n --arg seed "$pilot/seed-2000" '{seed: $seed, students: 2000}' >"$1/parameters.json"
+    jq -n --arg seed "${2:-$pilot/seed-2000}" --argjson settings "$settings" \
+        '{seed: $seed, students: 2000, images: {"artemis-thesis:x": "sha256:abc"}, settings: $settings}' >"$1/parameters.json"
 }
+
+# with_threshold <run-folder> <phase> <metric>: a k6 summary of <phase> in which the threshold of <metric> failed.
+with_threshold() {
+    mkdir -p "$1/$2"
+    jq -n --arg metric "$3" '{metrics: {($metric): {thresholds: {"count==0": {ok: false}}}, checks: {thresholds: {"rate==1": {ok: true}}}}}' >"$1/$2/summary.json"
+}
+
+judge() { node "$here/judge.mjs" run "$1" "$1/$2" >/dev/null; }
+field() { jq -r "$3" "$1/$2/run.json"; }
 
 good="$pilot/s2000/1-B/semantics.json"
 bad="$pilot/s2000/1-A/semantics.json"
@@ -44,60 +67,91 @@ bad="$pilot/s2000/1-A/semantics.json"
 out="$work/reference"
 new_set "$out"
 make_run "$out" 1-A "$bad" 99
+with_threshold "$out/1-A" phase1 phase1_submitted_in_time
 make_run "$out" 1-B "$good"
-node "$here/judge.mjs" run "$out" "$out/1-A" >/dev/null
-expect "failed 1-A is invalid" "$(jq .valid "$out/1-A/run.json")" false
-expect "failed 1-A sets no reference" "$([[ -e "$out/reference.json" ]] && echo yes || echo no)" no
-expect "failed 1-A is not compared" "$(jq .semanticsEqual "$out/1-A/run.json")" null
-node "$here/judge.mjs" run "$out" "$out/1-B" >/dev/null
+judge "$out" 1-A
+expect "failed 1-A is not valid" "$(field "$out" 1-A .outcome)" failed
+expect "failed 1-A sets no reference" "$(exists "$out/reference.json")" no
+expect "failed 1-A is not compared" "$(field "$out" 1-A .semanticsEqual)" null
+judge "$out" 1-B
 expect "valid 1-B becomes the reference" "$(jq -r .run "$out/reference.json")" 1-B
-expect "valid 1-B is valid" "$(jq .valid "$out/1-B/run.json")" true
+expect "valid 1-B is valid" "$(field "$out" 1-B .outcome)" valid
 
-# 2. Wrong results fail the independent check even with passing thresholds, so they cannot become the reference.
+# 2. Wrong results fail the independent check even with passing thresholds: a server failure, never the reference.
 out="$work/expected"
 new_set "$out"
 make_run "$out" 1-A "$bad" 0
-node "$here/judge.mjs" run "$out" "$out/1-A" >/dev/null
-expect "wrong scores with passing k6 are invalid" "$(jq .expectedResults "$out/1-A/run.json")" false
-expect "wrong scores set no reference" "$([[ -e "$out/reference.json" ]] && echo yes || echo no)" no
+judge "$out" 1-A
+expect "wrong scores with passing k6 are a server failure" "$(field "$out" 1-A '[.expectedResults, .outcome] | join(" ")')" "false failed"
+expect "wrong scores set no reference" "$(exists "$out/reference.json")" no
 
 # 3. A later run must equal the reference.
 out="$work/compare"
 new_set "$out"
 make_run "$out" 1-A "$good"
-node "$here/judge.mjs" run "$out" "$out/1-A" >/dev/null
+judge "$out" 1-A
 jq '.textExercise.submittedTexts = ["changed"]' "$good" >"$work/changed.json"
 make_run "$out" 1-B "$work/changed.json"
-node "$here/judge.mjs" run "$out" "$out/1-B" >/dev/null
-expect "semantics unlike the reference are invalid" "$(jq .semanticsEqual "$out/1-B/run.json")" false
+judge "$out" 1-B
+expect "semantics unlike the reference are not valid" "$(field "$out" 1-B '[.semanticsEqual, .outcome] | join(" ")')" "false failed"
 
-# 4. Provenance: a container with another image is invalid.
+# 4. Provenance against the frozen inputs (D44): the running container, the planned id, and the container settings.
 out="$work/provenance"
 new_set "$out"
 make_run "$out" 1-A "$good"
 jq '.runningImageId = "sha256:other"' "$out/1-A/exits.json" >"$work/exits.json" && mv "$work/exits.json" "$out/1-A/exits.json"
-node "$here/judge.mjs" run "$out" "$out/1-A" >/dev/null
-expect "another running image is invalid" "$(jq .valid "$out/1-A/run.json")" false
+judge "$out" 1-A
+expect "another running image is invalid" "$(field "$out" 1-A .outcome)" invalid
+out="$work/planned"
+new_set "$out"
+jq '.images["artemis-thesis:x"] = "sha256:def"' "$out/parameters.json" >"$work/p.json" && mv "$work/p.json" "$out/parameters.json"
+make_run "$out" 1-A "$good"
+judge "$out" 1-A
+expect "a run of another image than the frozen id is invalid, even if the tag now points to it" "$(field "$out" 1-A .outcome)" invalid
+out="$work/settings"
+new_set "$out"
+make_run "$out" 1-A "$good"
+jq '(.[] | select(.service == "artemis") | .env.POOL) = "12" | (.[] | select(.service == "postgres") | .memory) = 25' \
+    "$out/1-A/containers.json" >"$work/c.json" && mv "$work/c.json" "$out/1-A/containers.json"
+judge "$out" 1-A
+expect "a container with other settings than the frozen ones is invalid" \
+    "$(field "$out" 1-A '[.outcome, (.reasons[0] | test("POOL=12") and test("postgres memory 25"))] | join(" ")')" "invalid true"
 
-# 5. Completion only with enough valid runs per side.
+# 5. Load-generator problems and unknown thresholds make a run invalid, not a server failure.
+out="$work/generator"
+new_set "$out"
+make_run "$out" 1-A "$good" 99
+with_threshold "$out/1-A" phase1 dropped_iterations
+judge "$out" 1-A
+expect "dropped iterations make the run invalid" "$(field "$out" 1-A .outcome)" invalid
+make_run "$out" 1-B "$good" 1
+judge "$out" 1-B
+expect "a k6 error (exit 1) makes the run invalid" "$(field "$out" 1-B .outcome)" invalid
+
+# 6. Completion: no invalid run, and enough judged runs per side; a failed run counts as judged.
 out="$work/complete"
 new_set "$out"
 make_run "$out" 1-A "$good"
-make_run "$out" 1-B "$good"
-node "$here/judge.mjs" run "$out" "$out/1-A" >/dev/null
-node "$here/judge.mjs" run "$out" "$out/1-B" >/dev/null
+make_run "$out" 1-B "$bad" 99
+with_threshold "$out/1-B" phase1 phase1_submitted_in_time
+judge "$out" 1-A
+judge "$out" 1-B
 status=0
 node "$here/judge.mjs" complete "$out" 2 >/dev/null || status=$?
-expect "an under-replicated set is not complete" "$status/$([[ -e "$out/complete.json" ]] && echo yes || echo no)" 1/no
+expect "an under-replicated set is not complete" "$status/$(exists "$out/complete.json")" 1/no
 node "$here/judge.mjs" complete "$out" 1 >/dev/null
-expect "a set with every run valid is complete" "$(jq .validA "$out/complete.json")" 1
+expect "a set with a valid and a failed run is complete" "$(jq -c '[.validA, .failedB]' "$out/complete.json")" "[1,1]"
+make_run "$out" 2-A "$good" 1
+judge "$out" 2-A
+rm "$out/complete.json"
+status=0
+node "$here/judge.mjs" complete "$out" 1 >/dev/null || status=$?
+expect "a set with an invalid run is not complete" "$status/$(exists "$out/complete.json")" 1/no
 
-# 5b. A complete Phase 3 run whose freshness exceeds the H3 bound stays valid: it is evidence against H3 (D42, D43).
-#     An incomplete freshness measurement makes the run invalid.
-phase3_pilot="$(dirname "$pilot")/pilot-mac-2026-11-18-control/s2000/1-B"
+# 7. A complete Phase 3 run above the H3 bound stays valid (D42); an incomplete freshness measurement is invalid.
+phase3_pilot="$root/pilot-mac-2026-11-18-control/s2000/1-B"
 out="$work/h3"
-mkdir -p "$out"
-jq -n --arg seed "$(dirname "$pilot")/seed-2000-2026-11-18" '{seed: $seed, students: 2000}' >"$out/parameters.json"
+new_set "$out" "$seed"
 for name in 1-A 1-B; do
     make_run "$out" "$name" "$phase3_pilot/semantics.json"
     jq '.phase3Run = true | .phase3Exit = 0 | .freshnessExit = 0' "$out/$name/exits.json" >"$work/exits.json" && mv "$work/exits.json" "$out/$name/exits.json"
@@ -106,33 +160,121 @@ for name in 1-A 1-B; do
 done
 echo '{"complete":true,"errors":[],"p95Millis":3500,"p95Censored":true}' >"$out/1-A/phase3/freshness.json"
 echo '{"complete":false,"errors":["tutor 3 never subscribed"]}' >"$out/1-B/phase3/freshness.json"
-node "$here/judge.mjs" run "$out" "$out/1-A" >/dev/null
-node "$here/judge.mjs" run "$out" "$out/1-B" >/dev/null
-expect "a complete run above the H3 bound stays valid" "$(jq .valid "$out/1-A/run.json")" true
-expect "an incomplete freshness measurement is invalid" "$(jq .valid "$out/1-B/run.json")" false
+judge "$out" 1-A
+judge "$out" 1-B
+expect "a complete run above the H3 bound stays valid" "$(field "$out" 1-A .outcome)" valid
+expect "an incomplete freshness measurement is invalid" "$(field "$out" 1-B .outcome)" invalid
 
-# 6. run.sh refuses a used output folder.
+# 8. Replay of the saved f3463b75408 collapse (final pilot, json-answers 1-B): a server failure, kept as evidence, and a
+#    result set built from it fails H2 in the report. Provenance and settings are not recorded in that pilot, so the
+#    fixture adds matching ones; the outcome comes from the saved thresholds, evaluation, and semantics.
+replay="$work/replay"
+mkdir -p "$replay"
+jq --argjson settings "$settings" '.settings = $settings | .repetitions = 5 | .images[.sideA[-1]] = "sha256:abc" | .images[.sideB[-1]] = "sha256:abc"' \
+    "$final/json-answers/s2000/parameters.json" >"$replay/parameters.json"
+for name in 1-A 1-B; do
+    mkdir -p "$replay/$name"
+    (cd "$final/json-answers/s2000/$name" && cp -R exits.json images.json info.json semantics.json phase1 phase2 warm-up "$replay/$name/" &&
+        { [[ ! -e evaluation.txt ]] || cp evaluation.txt "$replay/$name/"; })
+    jq '.runningImageId = "sha256:abc"' "$replay/$name/exits.json" >"$work/exits.json" && mv "$work/exits.json" "$replay/$name/exits.json"
+    jq --arg image "$(jq -r .measured "$replay/$name/exits.json")" 'map(if .image == $image then .id = "sha256:abc" else . end)' \
+        "$replay/$name/images.json" >"$work/i.json" && mv "$work/i.json" "$replay/$name/images.json"
+    echo "$containers" >"$replay/$name/containers.json"
+    judge "$replay" "$name"
+done
+expect "the baseline run of the pair is valid" "$(field "$replay" 1-A .outcome)" valid
+expect "the f3463b75408 collapse is a server failure, not an invalid measurement" "$(field "$replay" 1-B .outcome)" failed
+expect "its reasons name the failed submissions and the missing evaluation" \
+    "$(field "$replay" 1-B '[(.reasons | map(select(test("phase1_submitted_in_time") or test("evaluation not logged"))) | length)] | .[0]')" 2
+for repetition in 2 3 4 5; do
+    for side in A B; do ln -s "$replay/1-$side" "$replay/$repetition-$side"; done
+done
+node "$here/judge.mjs" complete "$replay" 5 >/dev/null
+python3 "$here/report.py" --out "$work/replay.md" "$replay" >/dev/null
+expect "the report fails H2 for a result set whose candidate failed the workload" \
+    "$(grep -c '^| H2 submit p95 B/A .*\*\*fails\*\*: side B failed the workload in 5 of 5 runs' "$work/replay.md")" 1
+
+# 9. Report verdicts only for a result set of the targeted pair at 2000 students (D16, D37, D44).
+stats="$final/stats-on-demand/s2000"
+fake_set() {
+    local out="$1" students="$2" repetitions="$3" repetition side
+    mkdir -p "$out"
+    jq --argjson students "$students" --argjson repetitions "$repetitions" '.students = $students | .repetitions = $repetitions' \
+        "$stats/parameters.json" >"$out/parameters.json"
+    for repetition in $(seq "$repetitions"); do
+        for side in A B; do ln -s "$stats/1-$side" "$out/$repetition-$side"; done
+    done
+    jq -n --argjson r "$repetitions" '{repetitions: $r, validA: $r, failedA: 0, validB: $r, failedB: 0, invalid: []}' >"$out/complete.json"
+}
+fake_set "$work/s100" 100 2
+python3 "$here/report.py" --out "$work/s100.md" "$work/s100" >/dev/null
+expect "no verdict for two runs per side at 100 students" \
+    "$(grep '^| H[23] ' "$work/s100.md" | grep -vc 'no verdict (\(not the H2 pair, \)\?100 students, not 2000, complete pilot)')" 0
+fake_set "$work/s2000" 2000 5
+python3 "$here/report.py" --out "$work/s2000.md" "$work/s2000" >/dev/null
+expect "the H3 pair gives verdicts from a 2000-student result set" \
+    "$(grep '^| H3 ' "$work/s2000.md" | grep -c '| holds |$')" 4
+expect "H3 reads the initial reads, 5 overview observations per run" \
+    "$(grep -c '^| H3 statistics-overview initial p95 (ms) | [0-9.]* | 5 | < 1000 | holds |' "$work/s2000.md")" 1
+expect "the H3 pair gives no H2 verdict" "$(grep -c '^| H2 .*no verdict (not the H2 pair)' "$work/s2000.md")" 1
+
+# 10. Compose reads no ambient environment files; exported settings are recorded and frozen instead.
+printf 'ARTEMIS_DB_POOL_SIZE=12\nPOSTGRES_MEMORY=2g\n' >"$work/ambient.env"
+pool="$(COMPOSE_ENV_FILES="$work/ambient.env" bash -c 'here="$1"; source "$here/lib/stack.sh"; source "$here/lib/k6-limits.sh"; source "$here/lib/settings.sh"
+    settings_json | jq -c "[.compose.services.artemis.environment.SPRING_DATASOURCE_HIKARI_MAXIMUMPOOLSIZE, .compose.services.postgres.mem_limit]"' _ "$here")"
+expect "COMPOSE_ENV_FILES does not change the pool or the PostgreSQL memory" "$pool" '["100","3221225472"]'
+
+# 11. run.sh refuses a used output folder, a seed without its hashes, and inputs that differ from the campaign.
 mkdir -p "$work/used" && touch "$work/used/old"
 status=0
-"$here/run.sh" "$pilot/seed-2000" "$work/used" 10 a b >/dev/null 2>&1 || status=$?
+"$here/run.sh" "$seed" "$work/used" 10 a b >/dev/null 2>&1 || status=$?
 expect "run.sh refuses a non-empty output folder" "$status" 2
+mkdir -p "$work/noseed"
+cp "$seed/manifest.json" "$seed/artemis-data.tgz" "$work/noseed/"
+status=0
+message="$("$here/run.sh" "$work/noseed" "$work/noseed-out" 10 artemis-thesis:43bafcee17c artemis-thesis:8325896e0b4 2>&1 >/dev/null)" || status=$?
+expect "run.sh refuses a seed without seed.dump" "$((status != 0))/$(grep -c 'seed file missing' <<<"$message")" 1/1
+images=(artemis-thesis:43bafcee17c artemis-thesis:9.9.3 artemis-thesis:8325896e0b4 artemis-thesis:f3463b75408
+    artemis-thesis:c136826e299 artemis-thesis:24a062759c2)
+campaign_inputs_of() {
+    bash -c 'here="$1"; shift; source "$here/lib/inputs.sh"; source "$here/lib/stack.sh"; source "$here/lib/k6-limits.sh"
+        source "$here/lib/settings.sh"; campaign_inputs "$here" "$@"' _ "$here" "$@"
+}
+campaign_inputs_of "$seed" "${images[@]}" >"$work/inputs.json"
+jq '.settings.compose.services.artemis.environment.SPRING_DATASOURCE_HIKARI_MAXIMUMPOOLSIZE = "12"' "$work/inputs.json" >"$work/inputs-other.json"
+status=0
+message="$(CAMPAIGN="$work/inputs-other.json" "$here/run.sh" "$seed" "$work/campaign-out" 10 artemis-thesis:43bafcee17c artemis-thesis:8325896e0b4 2>&1 >/dev/null)" || status=$?
+expect "run.sh refuses settings that differ from the campaign" "$status/$(grep -c 'differ from the campaign.*settings' <<<"$message")" 2/1
 
-# 7. night.sh refuses pilot settings and changed inputs.
+# 12. night.sh: pilot settings refused; a copied pilot is not a finished scale; only a finished campaign set is skipped.
 status=0
-ROUNDS=1 NIGHT_AWAKE=1 RESULTS="$work/night" "$here/night.sh" e2e 100 >/dev/null 2>&1 || status=$?
+ROUNDS=1 NIGHT_CHECK=1 RESULTS="$work/night" "$here/night.sh" e2e 100 >/dev/null 2>&1 || status=$?
 expect "night.sh refuses a settings override" "$status" 1
-mkdir -p "$work/seed" "$work/night"
-for file in manifest.json seed.dump artemis-data.tgz; do echo "$file" >"$work/seed/$file"; done
-echo '{"toolRevision":"x","seed":{},"images":{},"engine":{}}' >"$work/night/inputs.json"
-status=0
-message="$(SEED_FOLDER="$work/seed" NIGHT_AWAKE=1 RESULTS="$work/night" "$here/night.sh" e2e 100 2>&1 >/dev/null)" || status=$?
-if git -C "$here" diff --quiet HEAD -- .; then
+if committed; then
+    mkdir -p "$work/night/e2e"
+    cp "$work/inputs.json" "$work/night/inputs.json"
+    cp -R "$final/e2e/s2000" "$work/night/e2e/s2000"
+    status=0
+    message="$(NIGHT_CHECK=1 SEED_FOLDER="$seed" RESULTS="$work/night" "$here/night.sh" e2e 2000 2>&1)" || status=$?
+    expect "a copied one-run pilot with complete.json is not a finished scale" "$status/$(grep -c 's2000: not finished' <<<"$message")" 1/1
+    jq --arg sha "$(shasum -a 256 "$work/night/inputs.json" | cut -d' ' -f1)" '.campaign = {sha256: $sha} | .repetitions = 5' \
+        "$final/e2e/s2000/parameters.json" >"$work/night/e2e/s2000/parameters.json"
+    echo '{"repetitions":5,"validA":5,"failedA":0,"validB":3,"failedB":2,"invalid":[]}' >"$work/night/e2e/s2000/complete.json"
+    status=0
+    message="$(NIGHT_CHECK=1 SEED_FOLDER="$seed" RESULTS="$work/night" "$here/night.sh" e2e 2000 2>&1)" || status=$?
+    expect "a finished campaign set, failures included, is skipped" "$status/$(grep -c 's2000: finished' <<<"$message")" 0/1
+    status=0
+    NIGHT_CHECK=1 SEED_FOLDER="$seed" RESULTS="$work/night" "$here/night.sh" e2e 1000 2000 >/dev/null 2>&1 || status=$?
+    expect "night.sh exits 1 if a requested scale is not finished" "$status" 1
+    jq '.images["artemis-thesis:9.9.3"] = "sha256:other"' "$work/inputs.json" >"$work/night/inputs.json"
+    status=0
+    message="$(NIGHT_CHECK=1 SEED_FOLDER="$seed" RESULTS="$work/night" "$here/night.sh" e2e 2000 2>&1)" || status=$?
     expect "night.sh refuses changed inputs" "$status/$(grep -c 'inputs differ' <<<"$message")" 1/1
 else
-    pass "night.sh changed inputs (skipped: track-b/ has uncommitted changes, which night.sh refuses first)"
+    pass "night.sh campaign checks (skipped: track-b/ has uncommitted changes, which night.sh refuses first)"
 fi
 
-# 8. freshness.mjs: every expected tutor must be observed; unseen values are censored, not dropped.
+# 13. freshness.mjs: every expected tutor must be observed; unseen values are censored, not dropped.
 freshness_fixture() {
     local folder="$1" tutors_seen="$2" last_shown="$3"
     mkdir -p "$folder"

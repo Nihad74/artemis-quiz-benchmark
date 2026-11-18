@@ -43,44 +43,50 @@ if [[ "$label" != "$seed_commit" ]]; then
     echo "the seed runs on the relational baseline $seed_commit, but $first is built from ${label:-an unknown commit}" >&2
     exit 2
 fi
-compose "$first" down -v --remove-orphans >/dev/null 2>&1 || true
-printf '%s\n' "${images[@]}" >"$out/images.txt"
+# Every image starts by the id it has now, so a tag that moves during the check changes nothing (D44).
+declare -A image_id=()
+for image in "${images[@]}"; do
+    image_id[$image]="$(docker image inspect "$image" --format '{{.Id}}')"
+done
+server() { compose "${image_id[$1]}" "${@:2}"; }
+server "$first" down -v --remove-orphans >/dev/null 2>&1 || true
+for image in "${images[@]}"; do echo "$image ${image_id[$image]}"; done >"$out/images.txt"
 : >"$out/migrating-start-seconds.txt"
 
 log "start $first on an empty database"
-compose "$first" up -d --wait --wait-timeout 900 >/dev/null 2>&1
+server "$first" up -d --wait --wait-timeout 900 >/dev/null 2>&1
 log "seed $students students"
 node "$here/seed.mjs" --server "http://localhost:$ARTEMIS_PORT" --students "$students" \
     --evaluated-duration "${EVALUATED_DURATION:-60}" --out "$out/manifest.json"
 node "$here/semantics.mjs" --manifest "$out/manifest.json" --out "$out/old.json"
 
 log "dump the database and the file storage"
-compose "$first" stop artemis >/dev/null 2>&1
-compose "$first" exec -T postgres pg_dump -U Artemis -d Artemis -Fc >"$out/seed.dump"
+server "$first" stop artemis >/dev/null 2>&1
+server "$first" exec -T postgres pg_dump -U Artemis -d Artemis -Fc >"$out/seed.dump"
 docker run --rm -v "${project}_artemis-data:/data:ro" -v "$out:/backup" alpine:3.24.3 tar czf /backup/artemis-data.tgz -C /data .
 
 log "restore into fresh volumes"
-restore_seed "$first" "$out"
+restore_seed "${image_id[$first]}" "$out"
 
 for image in "${images[@]:1}"; do
     name="${image#*:}"
     log "start $image on the restored database (forward migration)"
     start=$(date +%s)
-    if ! compose "$image" up -d --wait --wait-timeout 1800 artemis >/dev/null 2>&1; then
-        compose "$image" logs artemis >"$out/server-$name.log" 2>&1
+    if ! server "$image" up -d --wait --wait-timeout 1800 artemis >/dev/null 2>&1; then
+        server "$image" logs artemis >"$out/server-$name.log" 2>&1
         log "FAIL: $image did not become healthy; log: $out/server-$name.log"
         exit 1
     fi
     echo "$image $(($(date +%s) - start))" >>"$out/migrating-start-seconds.txt"
-    compose "$image" logs artemis >"$out/server-$name.log" 2>&1
+    server "$image" logs artemis >"$out/server-$name.log" 2>&1
     log "$image healthy after $(($(date +%s) - start)) s"
-    compose "$image" stop artemis >/dev/null 2>&1
+    server "$image" stop artemis >/dev/null 2>&1
 done
 
 last="${images[-1]}"
-compose "$last" up -d --wait --wait-timeout 900 artemis >/dev/null 2>&1
+server "$last" up -d --wait --wait-timeout 900 artemis >/dev/null 2>&1
 node "$here/semantics.mjs" --manifest "$out/manifest.json" --out "$out/new.json"
-compose "$last" down -v >/dev/null 2>&1
+server "$last" down -v >/dev/null 2>&1
 
 if diff <(jq -S 'del(.statisticsSource)' "$out/old.json") <(jq -S 'del(.statisticsSource)' "$out/new.json") >"$out/semantics.diff"; then
     log "PASS: same questions, answers, scores and statistics after the migration ($(jq -r .statisticsSource "$out/old.json") -> $(jq -r .statisticsSource "$out/new.json"))"
