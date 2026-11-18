@@ -212,7 +212,7 @@ container_facts() {
     for service in artemis postgres; do
         docker inspect "$(compose "$1" ps -q "$service")" | jq -c --arg service "$service" '.[0] | {service: $service,
             image: .Image, cpuset: .HostConfig.CpusetCpus, memory: .HostConfig.Memory, memorySwap: .HostConfig.MemorySwap,
-            env: (.Config.Env | map(capture("^(?<k>[^=]*)=(?<v>.*)$")) | from_entries)}'
+            env: (.Config.Env | map(capture("^(?<key>[^=]*)=(?<value>.*)$")) | from_entries)}'
     done | jq -s .
 }
 
