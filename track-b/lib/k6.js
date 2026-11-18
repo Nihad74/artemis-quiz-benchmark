@@ -67,3 +67,31 @@ export function trendLine(data, metric, label) {
     const values = data.metrics[metric]?.values ?? {};
     return `${label}: n=${values.count ?? 0} med=${values.med?.toFixed(1)} ms p95=${values['p(95)']?.toFixed(1)} ms p99=${values['p(99)']?.toFixed(1)} ms max=${values.max?.toFixed(1)} ms`;
 }
+
+/** STOMP heart-beat of the Artemis client (websocket.service.ts) and server (WebsocketConfiguration). */
+export const STOMP_HEARTBEAT_MS = 10_000;
+
+/** The plain websocket endpoint of Artemis (no SockJS), on every compared commit. */
+export function websocketUrl(server) {
+    return `${server.replace(/^http/, 'ws')}/websocket/websocket`;
+}
+
+/** A STOMP frame: the command, the headers, an empty line, the body, and NUL. */
+export function frame(command, headers, body = '') {
+    return `${command}\n${Object.entries(headers)
+        .map(([name, value]) => `${name}:${value}\n`)
+        .join('')}\n${body}\0`;
+}
+
+/** The frames of one websocket message; a message of only line feeds is a heart-beat and holds none. */
+export function frames(data) {
+    return data
+        .split('\0')
+        .map((text) => text.replace(/^\n+/, ''))
+        .filter((text) => text.length > 0)
+        .map((text) => {
+            const end = text.indexOf('\n\n');
+            const [command, ...headers] = (end < 0 ? text : text.slice(0, end)).split('\n');
+            return { command, headers: Object.fromEntries(headers.map((line) => [line.slice(0, line.indexOf(':')), line.slice(line.indexOf(':') + 1)])), body: end < 0 ? '' : text.slice(end + 2) };
+        });
+}

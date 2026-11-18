@@ -21,9 +21,12 @@
  * freshness measurable on both statistics models. The answers are lib/answers.mjs variant (index + 5), the same on every
  * commit (D19).
  *
- * Statistics freshness (glossary): for the n-th answered practice submission, the time from its response until a tutor's
- * page shows at least n new unrated participants. k6 VUs share no memory, so the script records the times as metric
- * points (phase3_practice_answered, phase3_seen with tag tutor) and freshness.mjs pairs them from raw.json.gz.
+ * Statistics freshness (glossary, D42) is an aggregate metric: for the n-th answered practice submission (in the order
+ * the responses arrived), the time from that response until a tutor's page first shows at least n new unrated
+ * participants. It does not follow one result: a count can become visible a few milliseconds before the n-th response
+ * reaches k6, so values may be negative and are kept signed. k6 VUs share no memory, so the script records the times as
+ * metric points (phase3_practice_answered, phase3_seen with tag tutor, phase3_subscribed, phase3_practice_sent) and
+ * freshness.mjs pairs them from raw.json.gz and checks that the measurement is complete.
  *
  * Environment:
  *   SERVER    base URL of Artemis (k6.sh: http://artemis:8080)
@@ -35,8 +38,9 @@
  *   DRAIN_SECONDS  how long after the last planned submission the pages may take to show all of them (default 300)
  *
  * Request tag `type`: practice-load, practice-submit, statistics-open (page data at the start), statistics-footer,
- * statistics-reload (on-demand only). A run is valid only if all thresholds hold: no failed request or check, every
- * submission answered, no dropped iteration (D38 rule 2), and every tutor's page showed every submission.
+ * statistics-reload (on-demand only). k6 thresholds: no failed request or check, every submission answered, no dropped
+ * iteration (D38 rule 2), no POST sent late. A page that has not shown every submission at the deadline does not fail a
+ * threshold: its missing values are censored at the deadline and count against the H3 bound (freshness.mjs, D42).
  */
 import { check, fail, sleep } from 'k6';
 import { SharedArray } from 'k6/data';
@@ -46,7 +50,7 @@ import { Counter, Trend } from 'k6/metrics';
 import { clearInterval, clearTimeout, setInterval, setTimeout } from 'k6/timers';
 import { WebSocket } from 'k6/websockets';
 import { practiceSubmission } from './lib/answers.mjs';
-import { cookieHeader, failedThresholds, params, statisticsMode, trendLine, useSession } from './lib/k6.js';
+import { cookieHeader, failedThresholds, frame, frames, params, statisticsMode, STOMP_HEARTBEAT_MS, trendLine, useSession, websocketUrl } from './lib/k6.js';
 
 const SERVER = __ENV.SERVER;
 const OUT = __ENV.OUT;
@@ -58,8 +62,6 @@ const DRAIN_SECONDS = Number(__ENV.DRAIN_SECONDS ?? 300);
 const PRACTICE_START_S = 5;
 const THINK_S = 10;
 const PRACTICE_VARIANT = 5;
-// STOMP heart-beat of the Artemis client (websocket.service.ts) and server (WebsocketConfiguration).
-const HEARTBEAT_MS = 10_000;
 
 const config = new SharedArray('config', () => {
     const manifest = JSON.parse(open(`${OUT}/manifest.json`));
@@ -92,6 +94,10 @@ const seen = new Trend('phase3_seen');
 const messages = new Counter('phase3_messages');
 const pagesComplete = new Counter('phase3_pages_complete');
 const behindSchedule = new Counter('phase3_behind_schedule');
+// Evidence for freshness.mjs: when each tutor sent its SUBSCRIBE (the server sends no receipt), and when each practice POST
+// was sent (the arrival executor paces iteration starts, not POST starts).
+const subscribed = new Counter('phase3_subscribed');
+const practiceSent = new Counter('phase3_practice_sent');
 
 const TYPES = ['practice-load', 'practice-submit', 'statistics-open', 'statistics-footer', 'statistics-reload'];
 export const options = {
@@ -126,7 +132,7 @@ export const options = {
         http_req_failed: ['rate==0'],
         dropped_iterations: ['count==0'],
         phase3_practice_answered: [`count==${SUBMISSIONS}`],
-        phase3_pages_complete: [`count==${tutors.length}`],
+        phase3_behind_schedule: ['count==0'],
         // Always-true thresholds make k6 keep these submetrics in the summary.
         ...Object.fromEntries(TYPES.map((type) => [`http_req_duration{type:${type}}`, ['max>=0']])),
     },
@@ -145,26 +151,6 @@ export function setup() {
         fail(`quiz ${config.quizId} has not ended (HTTP ${quiz.status}); practice opens after the end`);
     }
     return { mode, start: Date.now() };
-}
-
-/** A STOMP frame: the command, the headers, an empty line, the body, and NUL. */
-function frame(command, headers, body = '') {
-    return `${command}\n${Object.entries(headers)
-        .map(([name, value]) => `${name}:${value}\n`)
-        .join('')}\n${body}\0`;
-}
-
-/** The frames of one websocket message; a message of only line feeds is a heart-beat and holds none. */
-function frames(data) {
-    return data
-        .split('\0')
-        .map((text) => text.replace(/^\n+/, ''))
-        .filter((text) => text.length > 0)
-        .map((text) => {
-            const end = text.indexOf('\n\n');
-            const [command, ...headers] = (end < 0 ? text : text.slice(0, end)).split('\n');
-            return { command, headers: Object.fromEntries(headers.map((line) => [line.slice(0, line.indexOf(':')), line.slice(line.indexOf(':') + 1)])), body: end < 0 ? '' : text.slice(end + 2) };
-        });
 }
 
 /** Unrated participants of the point statistic in a page response or a stored-statistics message. */
@@ -194,7 +180,7 @@ export function pages(run) {
     let reloading = false;
     let reloadAgain = false;
     let heartbeat = null;
-    const ws = new WebSocket(`${SERVER.replace(/^http/, 'ws')}/websocket/websocket`, null, { headers: { Cookie: cookieHeader(tutor) }, tags: { type: 'statistics-websocket' } });
+    const ws = new WebSocket(websocketUrl(SERVER), null, { headers: { Cookie: cookieHeader(tutor) }, tags: { type: 'statistics-websocket' } });
     const finish = (complete) => {
         if (done) {
             return;
@@ -232,13 +218,14 @@ export function pages(run) {
     };
 
     ws.onopen = () => {
-        ws.send(frame('CONNECT', { 'accept-version': '1.2', 'heart-beat': `${HEARTBEAT_MS},${HEARTBEAT_MS}`, host: 'artemis' }));
-        heartbeat = setInterval(() => ws.send('\n'), HEARTBEAT_MS);
+        ws.send(frame('CONNECT', { 'accept-version': '1.2', 'heart-beat': `${STOMP_HEARTBEAT_MS},${STOMP_HEARTBEAT_MS}`, host: 'artemis' }));
+        heartbeat = setInterval(() => ws.send('\n'), STOMP_HEARTBEAT_MS);
     };
     ws.onmessage = (event) => {
         for (const { command, body } of frames(event.data)) {
             if (command === 'CONNECTED') {
                 ws.send(frame('SUBSCRIBE', { id: 'statistic', destination: `/topic/statistic/${config.quizId}` }));
+                subscribed.add(1, tags);
             } else if (command === 'MESSAGE') {
                 messages.add(1, tags);
                 if (run.mode === 'stored') {
@@ -286,6 +273,7 @@ export function practice() {
     } else {
         behindSchedule.add(1);
     }
+    practiceSent.add(1);
     const submitted = http.post(
         `${SERVER}/api/quiz/exercises/${config.quizId}/submissions/practice`,
         JSON.stringify(practiceSubmission(questions, index + PRACTICE_VARIANT)),
@@ -313,6 +301,7 @@ export function handleSummary(data) {
             tutors: tutors.length,
             thinkSeconds: THINK_S,
             practiceStartSeconds: PRACTICE_START_S,
+            deadline: setup.start ? setup.start + DEADLINE_MS : null,
         })}\n`,
         stdout: `${[
             `Phase 3 (${QUIZ} quiz ${config.quizId}, ${setup.mode} statistics, ${SUBMISSIONS} practice submissions at ${RATE}/s, ${tutors.length} tutors)`,

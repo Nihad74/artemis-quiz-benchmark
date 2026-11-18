@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Track B run loop (D6, D13, D14, D17, D36, D38): REPETITIONS runs of side A and side B, alternating (A, B, A, B, ...),
-# each from a fresh restore of the same seed (D2 same-data rule).
+# Track B run loop (D6, D13, D14, D17, D36, D38): REPETITIONS runs of side A and side B in balanced order (repetition 1
+# A then B, repetition 2 B then A, ...), each from a fresh restore of the same seed (D2 same-data rule). Needs Bash 5.
 #
 # Usage: run.sh <seed-folder> <out-folder> <students> <A-images> <B-images>
+#   out-folder   must not exist or be empty: a run set is never mixed with an earlier attempt
 #   seed-folder  seed.dump, artemis-data.tgz, and manifest.json of the baseline seed (migration-check.sh output, D18)
 #   students     the first N students of the manifest take the benchmark quiz
 #   A-, B-images comma-separated image chains; every image restores onto the database of the one before (Liquibase
 #                migrates forward), the last one is measured. End-to-end comparison:
 #                  artemis-thesis:43bafcee17c  artemis-thesis:9.9.3,artemis-thesis:8325896e0b4
-# Environment: REPETITIONS (5), WARMUP_STUDENTS (100), ROUNDS (20, Phase 2 rounds per tutor), WARMUP_ROUNDS (5), SEED (1),
+# Environment: REPETITIONS (5), WARMUP_STUDENTS (100), ROUNDS (21, Phase 2 rounds per tutor), WARMUP_ROUNDS (5), SEED (1),
 # CONTROL (1; 0 drops the control workflow, D20), PHASE3 (1; 0 drops Phase 3, D10, D38 rule 6), PRACTICE_RATE (10
 # practice submissions per second), PRACTICE_SECONDS (60), DRAIN_SECONDS (300, see phase3.js), SETTLE_SECONDS (15),
 # SAMPLE_SECONDS (5), ARTEMIS_PORT (18080), and the limits of compose.yml and lib/k6-limits.sh.
@@ -33,28 +34,39 @@
 #  6. Phase 3 (phase3/: practice submissions at a fixed rate while the statistics pages stay open, D10, D15), then
 #     SETTLE_SECONDS, pg-stat-after-phase3.csv and proc-stat-after-phase3.txt, and the statistics freshness
 #     (freshness.mjs: phase3/freshness.json).
-#  7. D19 semantics of the benchmark quiz (semantics.json), compared with the first run (D38 rule 7). After Phase 3 they
-#     include the practice results (unrated statistics); after the control workflow, the submitted texts.
+#  7. D19 semantics of the benchmark quiz (semantics.json). After Phase 3 they include the practice results (unrated
+#     statistics); after the control workflow, the submitted texts.
 #  8. Server log, tear down, delete the login cookies.
-# run.json of each run records its validity (D38): all k6 runs passed their thresholds (no failed or late request, no
-# dropped iteration, every statistics page loaded and complete, every practice submission shown on every open page), both
-# evaluations were logged, and the semantics equal those of the first run. It also records the statistics mode Phase 2
-# found, how long after the end of the evaluation Phase 2 started, and the statistics freshness. runs.tsv lists all runs.
+# judge.mjs then writes run.json: the run is valid only if every k6 run passed its thresholds, both evaluations were
+# logged, the Phase 3 freshness measurement is complete, the running image and the server commit match the image, the
+# results equal the expected results of the deterministic answers, and the semantics equal those of the reference run
+# (the first run of the set that passed every other check). After the last run, judge.mjs writes complete.json only if
+# every side has REPETITIONS valid runs; run.sh then exits 0, else 1. parameters.json records the parameters, the SHA-256
+# of the seed files, and the image ids. runs.tsv lists all runs, valid or not.
 set -euo pipefail
+if ((BASH_VERSINFO[0] < 5)); then
+    echo "run.sh needs Bash 5 or later (EPOCHREALTIME); this is $BASH_VERSION" >&2
+    exit 2
+fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
 project="trackb-run"
 source "$here/lib/stack.sh"
 source "$here/lib/k6-limits.sh"
+source "$here/lib/inputs.sh"
 
 seed="$(cd "$1" && pwd)"
+if [[ -e "$2" && -n "$(ls -A "$2")" ]]; then
+    echo "$2 is not empty; a run set starts in a new folder (move an earlier attempt aside)" >&2
+    exit 2
+fi
 out="$(mkdir -p "$2" && cd "$2" && pwd)"
 students="$3"
 IFS=, read -ra side_a <<<"$4"
 IFS=, read -ra side_b <<<"$5"
 repetitions="${REPETITIONS:-5}"
 warmup_students="${WARMUP_STUDENTS:-100}"
-rounds="${ROUNDS:-20}"
+rounds="${ROUNDS:-21}"
 warmup_rounds="${WARMUP_ROUNDS:-5}"
 schedule_seed="${SEED:-1}"
 settle="${SETTLE_SECONDS:-15}"
@@ -89,7 +101,8 @@ jq -n --arg seed "$seed" --argjson students "$students" --argjson repetitions "$
     --argjson practiceRate "$practice_rate" --argjson practiceSeconds "$practice_seconds" --argjson drainSeconds "$drain" \
     --argjson sampleSeconds "$sample_every" --arg k6Cpuset "$K6_CPUSET" --arg k6Memory "$K6_MEMORY" \
     --arg toolRevision "$(git -C "$here" rev-parse HEAD)$(git -C "$here" diff --quiet HEAD -- . || echo '-dirty')" \
-    --arg startedAt "$(date -u +%FT%TZ)" \
+    --arg startedAt "$(date -u +%FT%TZ)" --arg order "balanced: odd repetitions A then B, even repetitions B then A" \
+    --argjson seedHashes "$(seed_hashes "$seed")" --argjson images "$(image_ids "${side_a[@]}" "${side_b[@]}")" \
     '$ARGS.named + {sideA: $ARGS.positional[0] | split(","), sideB: $ARGS.positional[1] | split(",")}' \
     --args "$4" "$5" >"$out/parameters.json"
 
@@ -130,14 +143,15 @@ phase_folders() {
     done
 }
 
-# run_phase3 <phase3-folder> <quiz> <students>: Phase 3 and its statistics freshness (freshness.json); returns the exit
-# status of k6.
+# run_phase3 <phase3-folder> <quiz> <students> <k6-exit-variable> <freshness-exit-variable>: Phase 3 and its statistics
+# freshness (freshness.json); stores the exit statuses of k6 and of freshness.mjs in the caller's variables.
 run_phase3() {
-    local folder="$1" status=0
+    local folder="$1" k6_status=0 freshness_status=0
     "$here/k6.sh" "$project" phase3.js "$folder" -e QUIZ="$2" -e STUDENTS="$3" -e PRACTICE_RATE="$practice_rate" \
-        -e PRACTICE_SECONDS="$practice_seconds" -e DRAIN_SECONDS="$drain" >"$folder/k6.log" 2>&1 || status=$?
-    node "$here/freshness.mjs" "$folder" >>"$folder/k6.log" 2>&1 || true
-    return "$status"
+        -e PRACTICE_SECONDS="$practice_seconds" -e DRAIN_SECONDS="$drain" >"$folder/k6.log" 2>&1 || k6_status=$?
+    node "$here/freshness.mjs" "$folder" >>"$folder/k6.log" 2>&1 || freshness_status=$?
+    printf -v "$4" '%s' "$k6_status"
+    printf -v "$5" '%s' "$freshness_status"
 }
 
 # sample <image> <run-folder>: every SAMPLE_SECONDS (measured from the start of each sample) until <run-folder>/.stop
@@ -168,9 +182,9 @@ measure() {
     local repetition="$1" side="$2"
     shift 2
     local images=("$@") dir="$out/$repetition-$side"
-    local measured="${images[-1]}" image start evaluated=true semantics_ok=true
-    local warmup_control_exit=0 warmup_phase1_exit=0 warmup_phase2_exit=0 warmup_phase3_exit=0
-    local control_exit=0 phase1_exit=0 phase2_exit=0 phase3_exit=0
+    local measured="${images[-1]}" image start evaluated=true semantics_exit=0
+    local warmup_control_exit=0 warmup_phase1_exit=0 warmup_phase2_exit=0 warmup_phase3_exit=0 warmup_freshness_exit=0
+    local control_exit=0 phase1_exit=0 phase2_exit=0 phase3_exit=0 freshness_exit=0
     mkdir -p "$dir"
 
     log "run $repetition-$side: restore, start ${images[*]}"
@@ -189,6 +203,8 @@ measure() {
         docker image inspect "$image" --format '{{json .}}' | jq -c --arg image "$image" \
             '{image: $image, id: .Id, commit: .Config.Labels["thesis.commit"], head: .Config.Labels["thesis.head"]}'
     done | jq -s . >"$dir/images.json"
+    local running_image
+    running_image="$(docker inspect --format '{{.Image}}' "$(compose "$measured" ps -q artemis)")"
     curl -sf "$server/management/info" | jq '{version: .build.version, commit: .git.commit.id.full}' >"$dir/info.json"
 
     node "$here/login.mjs" --manifest "$manifest" --server "$server" --students "$students" --out "$dir/sessions.json"
@@ -208,7 +224,7 @@ measure() {
     "$here/k6.sh" "$project" phase2.js "$dir/warm-up/phase2" -e QUIZ=warmUp -e STUDENTS="$warmup_students" \
         -e ROUNDS="$warmup_rounds" -e SEED="$schedule_seed" >"$dir/warm-up/phase2/k6.log" 2>&1 || warmup_phase2_exit=$?
     if [[ "$phase3" == 1 ]]; then
-        run_phase3 "$dir/warm-up/phase3" warmUp "$warmup_students" || warmup_phase3_exit=$?
+        run_phase3 "$dir/warm-up/phase3" warmUp "$warmup_students" warmup_phase3_exit warmup_freshness_exit
     fi
     sleep "$settle"
 
@@ -238,7 +254,7 @@ measure() {
     compose "$measured" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-after.txt"
     if [[ "$phase3" == 1 ]]; then
         log "run $repetition-$side: Phase 3, $practice_rate practice submissions per second for at most $practice_seconds s"
-        run_phase3 "$dir/phase3" benchmark "$students" || phase3_exit=$?
+        run_phase3 "$dir/phase3" benchmark "$students" phase3_exit freshness_exit
         sleep "$settle"
         pg_stat "$measured" >"$dir/pg-stat-after-phase3.csv"
         compose "$measured" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-after-phase3.txt"
@@ -251,53 +267,32 @@ measure() {
 
     log "run $repetition-$side: semantics"
     node "$here/semantics.mjs" --manifest "$manifest" --server "$server" --quiz benchmark --students "$students" \
-        --out "$dir/semantics.json" || semantics_ok=false
+        --out "$dir/semantics.json" || semantics_exit=$?
     compose "$measured" logs artemis >"$dir/server.log" 2>&1
     compose "$measured" down -v >/dev/null 2>&1
     find "$dir" -name sessions.json -delete
 
-    # D38 rule 7: same answers, scores, and statistics as the first run; where the statistics come from and the dates of
-    # the started quizzes may differ.
-    local reference="$out/1-A/semantics.normalized.json"
-    if [[ "$semantics_ok" == true ]]; then
-        jq -S 'del(.statisticsSource, .benchmarkQuiz, .warmUpQuiz)' "$dir/semantics.json" >"$dir/semantics.normalized.json"
-        if [[ -e "$reference" ]] && ! cmp -s "$reference" "$dir/semantics.normalized.json"; then
-            semantics_ok=false
-        fi
-    fi
-    # The end of the evaluation (timestamp of the D17 line) and the start of Phase 2 (phase2.json) come from the same
-    # Docker VM clock.
-    local evaluation_millis=null evaluation_end=null phase2_setup=null freshness=null
-    if [[ "$evaluated" == true ]]; then
-        evaluation_millis="$(sed -E 's/.*durationMillis=([0-9]+).*/\1/' "$dir/evaluation.txt")"
-        evaluation_end="$(node -e 'console.log(Date.parse(process.argv[1]))' "$(grep -m1 -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' "$dir/evaluation.txt")")"
-    fi
-    [[ ! -e "$dir/phase2/phase2.json" ]] || phase2_setup="$(cat "$dir/phase2/phase2.json")"
-    [[ ! -e "$dir/phase3/freshness.json" ]] || freshness="$(cat "$dir/phase3/freshness.json")"
-    jq -n --argjson repetition "$repetition" --arg side "$side" --arg measured "$measured" \
+    jq -n --argjson repetition "$repetition" --arg side "$side" --arg measured "$measured" --arg runningImageId "$running_image" \
         --argjson warmUpControlExit "$warmup_control_exit" --argjson controlExit "$control_exit" \
         --argjson warmUpPhase1Exit "$warmup_phase1_exit" --argjson warmUpPhase2Exit "$warmup_phase2_exit" \
-        --argjson warmUpPhase3Exit "$warmup_phase3_exit" --argjson phase1Exit "$phase1_exit" --argjson phase2Exit "$phase2_exit" \
-        --argjson phase3Exit "$phase3_exit" --argjson evaluated "$evaluated" \
-        --argjson evaluationMillis "$evaluation_millis" --argjson evaluationEnd "$evaluation_end" \
-        --argjson phase2 "$phase2_setup" --argjson freshness "$freshness" --argjson semanticsEqual "$semantics_ok" \
+        --argjson warmUpPhase3Exit "$warmup_phase3_exit" --argjson warmUpFreshnessExit "$warmup_freshness_exit" \
+        --argjson phase1Exit "$phase1_exit" --argjson phase2Exit "$phase2_exit" --argjson phase3Exit "$phase3_exit" \
+        --argjson freshnessExit "$freshness_exit" --argjson semanticsExit "$semantics_exit" --argjson evaluated "$evaluated" \
         --argjson phase3Run "$([[ "$phase3" == 1 ]] && echo true || echo false)" \
         --argjson controlRun "$([[ "$control" == 1 ]] && echo true || echo false)" \
-        '$ARGS.named + {
-            statisticsMode: $phase2.mode,
-            phase2DelayMillis: (if $phase2.start and $evaluationEnd then $phase2.start - $evaluationEnd else null end),
-            freshnessMedianMillis: $freshness.medianMillis,
-            freshnessP95Millis: $freshness.p95Millis,
-            valid: ($warmUpControlExit == 0 and $warmUpPhase1Exit == 0 and $warmUpPhase2Exit == 0 and $warmUpPhase3Exit == 0
-                and $controlExit == 0 and $phase1Exit == 0 and $phase2Exit == 0 and $phase3Exit == 0 and $evaluated
-                and $semanticsEqual)
-        } | del(.phase2, .freshness)' >"$dir/run.json"
-    log "run $repetition-$side: $(jq -c '{valid, warmUpControlExit, warmUpPhase1Exit, warmUpPhase2Exit, warmUpPhase3Exit, controlExit, phase1Exit, phase2Exit, phase3Exit, evaluationMillis, statisticsMode, phase2DelayMillis, freshnessP95Millis, semanticsEqual}' "$dir/run.json")"
+        '$ARGS.named' >"$dir/exits.json"
+    log "run $repetition-$side: $(node "$here/judge.mjs" run "$out" "$dir")"
 }
 
+# Balanced order: repetition 1 runs A then B, repetition 2 B then A, and so on.
 for repetition in $(seq "$repetitions"); do
-    measure "$repetition" A "${side_a[@]}"
-    measure "$repetition" B "${side_b[@]}"
+    if ((repetition % 2 == 1)); then
+        measure "$repetition" A "${side_a[@]}"
+        measure "$repetition" B "${side_b[@]}"
+    else
+        measure "$repetition" B "${side_b[@]}"
+        measure "$repetition" A "${side_a[@]}"
+    fi
 done
 
 {
@@ -319,9 +314,10 @@ done
                 def p95($summary; $type): $summary[0].metrics["http_req_duration{type:\($type)}"].values["p(95)"] // null | round1;
                 [$run, $r[0].measured, ($r[0].valid | tostring), p95($c; "control-submit"), p95($p1; "start-participation"), p95($p1; "save"),
                     p95($p1; "submit"), ($r[0].evaluationMillis // "-" | tostring), ($r[0].statisticsMode // "-"),
-                    p95($p2; "statistics-overview"), p95($p2; "statistics-points"), p95($p2; "statistics-question"),
+                    p95($p2; "statistics-overview,read:repeated"), p95($p2; "statistics-points,read:repeated"), p95($p2; "statistics-question,read:repeated"),
                     p95($p3; "practice-submit"), ($r[0].freshnessP95Millis | round1)] | @tsv'
         done
     done
 } >"$out/runs.tsv"
 column -t -s $'\t' "$out/runs.tsv"
+node "$here/judge.mjs" complete "$out" "$repetitions"

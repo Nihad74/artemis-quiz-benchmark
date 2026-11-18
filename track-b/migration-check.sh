@@ -3,7 +3,9 @@
 #
 # Usage: migration-check.sh <output-folder> <students> <first-image> [<step-image> ...] <last-image>
 # EVALUATED_DURATION (default 60) is the duration of the seeded evaluated quiz in seconds: every student must load, start,
-# save, and submit within it, so thousands of students need more (2000 students: 300).
+# save, and submit within it, so thousands of students need more (2000 students: 300). SEED_COMMIT (default 43bafcee17c)
+# is the commit the first image must be built from (label thesis.commit): seed.mjs only checks the version 9.9, which
+# f3463b75408 reports as well.
 #
 # 1. Start the first image on an empty database; Liquibase creates the schema.
 # 2. Seed it (seed.mjs): users, a course, an evaluated quiz with answers, results and statistics, and a benchmark quiz.
@@ -35,6 +37,12 @@ export JAVA_HEAP="${JAVA_HEAP:--Xms2g -Xmx2g}"
 source "$here/lib/stack.sh"
 
 first="${images[0]}"
+seed_commit="${SEED_COMMIT:-43bafcee17c}"
+label="$(docker image inspect "$first" --format '{{index .Config.Labels "thesis.commit"}}')"
+if [[ "$label" != "$seed_commit" ]]; then
+    echo "the seed runs on the relational baseline $seed_commit, but $first is built from ${label:-an unknown commit}" >&2
+    exit 2
+fi
 compose "$first" down -v --remove-orphans >/dev/null 2>&1 || true
 printf '%s\n' "${images[@]}" >"$out/images.txt"
 : >"$out/migrating-start-seconds.txt"

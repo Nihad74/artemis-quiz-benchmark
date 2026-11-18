@@ -4,13 +4,18 @@
 Usage: python3 report.py --out results.md <run-set> [<run-set> ...]
 
 A run set is one run.sh output folder (parameters.json, <repetition>-<side>/). The report lists, per run set, the
-validity of every run (D38), the request durations of Phases 1 to 3 (k6 summaries), the evaluation duration (D17), the
-statistics freshness of Phase 3 (freshness.json), the resources of the containers, and the written rows; then side A
-against side B over the valid runs only. With at least two valid runs per side it adds a 95% bootstrap confidence
-interval of the median over runs (D6, D38 rule 3); with fewer, the value of the single run. p99 is shown only with at
-least 100 observations (D38 rule 4).
+validity of every run with its reasons (judge.mjs, D38), the achieved workload (requests, rates, dropped iterations), the
+request durations of the control workflow and Phases 1 to 3 (k6 summaries), the time to result and the evaluation
+duration (D17), the initial and the repeated statistics reads of Phase 2, the statistics freshness of Phase 3
+(freshness.json, censored values marked), the sampled maxima of the containers, and the written rows; then side A
+against side B over the valid runs only. Every comparison value is first computed per run (median, p95, or p99 of that
+run's requests) and then summarized over runs: the median of the per-run values and, with at least two valid runs per
+side, a 95% percentile bootstrap interval over runs (D6, D38 rule 3); requests are never resampled. p99 is shown only if
+every run has at least 100 observations (D38 rule 4).
 
-Run sets with fewer than 5 runs per side are pilots (D6); the report says so. Standard library only.
+A run set counts by its valid runs: with fewer than 5 valid runs per side it is a pilot or an incomplete attempt (D6),
+and the report says so; complete.json (judge.mjs) marks a complete set. Invalid runs are listed, never used as
+observations. Standard library only.
 """
 
 import argparse
@@ -28,6 +33,7 @@ CONTROL_TYPES = ["control-start", "control-load", "control-submit"]
 PHASE1_TYPES = ["start-participation", "save", "submit"]
 PHASE2_TYPES = ["statistics-overview", "statistics-points", "statistics-question", "statistics-footer"]
 PHASE3_TYPES = ["practice-load", "practice-submit", "statistics-open", "statistics-reload"]
+READS = ["initial", "repeated"]
 PAGES = ["overview", "points", "question"]
 MIN_RUNS = 5  # D6
 MIN_P99 = 100  # D38 rule 4
@@ -103,6 +109,9 @@ class Run:
         return bool(self.info.get("valid"))
 
     def reasons(self):
+        if "reasons" in self.info:
+            return self.info["reasons"]
+        # run.json before judge.mjs (pilots of 2026-11-17 and 2026-11-18).
         reasons = [f"{key} {value}" for key, value in self.info.items() if key.endswith("Exit") and value != 0]
         if self.info.get("evaluated") is False:
             reasons.append("evaluation not logged")
@@ -164,19 +173,62 @@ def median_with_interval(values, rng):
     return f"{median:.1f} [{low:.1f}, {high:.1f}] (n={len(values)})"
 
 
+def phase2_metric(summary, type_, read):
+    """A Phase 2 metric of one read; run sets before the read tag (2026-11-18) have only the untagged metric."""
+    tagged = trend(summary, f"http_req_duration{{type:{type_},read:{read}}}")
+    if tagged or read == "initial":
+        return tagged
+    return trend(summary, f"http_req_duration{{type:{type_}}}")
+
+
+def summary_of(run, phase):
+    return {0: run.control, 1: run.phase1, 2: run.phase2, 3: run.phase3}[phase]
+
+
+def duration_row(name, label, values):
+    n = values.get("count")
+    if not n:
+        return None
+    p99 = values.get("p(99)") if n >= MIN_P99 else None
+    return f"| {name} | {label} | {n:.0f} | {ms(values.get('med'))} | {ms(values.get('p(95)'))} | {ms(p99)} | {ms(values.get('max'))} |"
+
+
 def duration_rows(runs, phase, types, prefix="http_req_duration{type:", suffix="}"):
     lines = []
     for run in runs:
-        summary = {0: run.control, 1: run.phase1, 2: run.phase2, 3: run.phase3}[phase]
+        summary = summary_of(run, phase)
         if summary is None:
             continue
         for type_ in types:
-            values = trend(summary, f"{prefix}{type_}{suffix}")
-            n = values.get("count")
-            if not n:
-                continue
-            p99 = values.get("p(99)") if n >= MIN_P99 else None
-            lines.append(f"| {run.name} | {type_} | {n:.0f} | {ms(values.get('med'))} | {ms(values.get('p(95)'))} | {ms(p99)} | {ms(values.get('max'))} |")
+            row = duration_row(run.name, type_, trend(summary, f"{prefix}{type_}{suffix}"))
+            if row:
+                lines.append(row)
+    return lines
+
+
+def phase2_rows(runs, types):
+    lines = []
+    for run in runs:
+        for type_ in types:
+            for read in READS:
+                row = duration_row(run.name, f"{type_} ({read})", phase2_metric(run.phase2, type_, read))
+                if row:
+                    lines.append(row)
+    return lines
+
+
+def workload_rows(run):
+    """Achieved requests and rates per phase (D35, D38 rule 2): count over the k6 run time."""
+    lines = []
+    for label, summary in (("control", run.control), ("Phase 1", run.phase1), ("Phase 2", run.phase2), ("Phase 3", run.phase3)):
+        if summary is None:
+            continue
+        requests = count(summary, "http_reqs") or 0
+        seconds = (summary.get("state", {}).get("testRunDurationMs") or 0) / 1000
+        rate = f"{requests / seconds:.1f}" if seconds else "–"
+        dropped = count(summary, "dropped_iterations") or 0
+        failed = count(summary, "http_req_failed", "passes") or 0
+        lines.append(f"| {run.name} | {label} | {requests:.0f} | {seconds:.1f} | {rate} | {dropped:.0f} | {failed:.0f} |")
     return lines
 
 
@@ -201,20 +253,34 @@ def run_set_section(folder, label, rng):
     out.append("")
     out.append(f"- Side A: `{' → '.join(parameters.get('sideA', []))}`")
     out.append(f"- Side B: `{' → '.join(parameters.get('sideB', []))}`")
-    if min(len(side_runs["A"]), len(side_runs["B"])) < MIN_RUNS:
-        out.append(f"- **Pilot:** fewer than {MIN_RUNS} runs per side (D6). The numbers are for orientation only; they are no result set.")
+    valid = {side: [run for run in side_runs[side] if run.valid] for side in "AB"}
+    complete = load(folder / "complete.json")
+    if complete:
+        out.append(f"- **Complete** (complete.json): {complete['validA']} and {complete['validB']} valid runs per side.")
+    elif min(len(valid["A"]), len(valid["B"])) < MIN_RUNS:
+        out.append(f"- **Pilot or incomplete attempt:** {len(valid['A'])} and {len(valid['B'])} valid runs per side, fewer than "
+                   f"{MIN_RUNS} (D6). The numbers are for orientation only; they are no result set.")
     out.append("")
 
-    out += ["### Runs", "", "| Run | Measured | Valid | Reasons | Statistics | Phase 2 delay | Submissions in time | Failed requests (control / Phase 1 / 2 / 3) |", "|---|---|---|---|---|---|---|---|"]
+    out += ["### Runs", "", "| Run | Measured | Valid | Reasons | Statistics | Phase 2 first request after evaluation | Submissions in time | Failed requests (control / Phase 1 / 2 / 3) |", "|---|---|---|---|---|---|---|---|"]
     for run in runs:
-        delay = run.info.get("phase2DelayMillis")
+        delay = run.info.get("phase2FirstRequestDelayMillis", run.info.get("phase2DelayMillis"))
         submitted = count(run.phase1, "phase1_submitted_in_time")
         in_time = "–" if submitted is None else f"{submitted:.0f} of {parameters.get('students')}"
         failed = [count(summary, "http_req_failed", "passes") for summary in (run.control, run.phase1, run.phase2, run.phase3)]
-        out.append(f"| {run.name} | `{run.info.get('measured', '?')}` | {'yes' if run.valid else '**no**'} | {', '.join(run.reasons()) or '–'} | "
+        out.append(f"| {run.name} | `{run.info.get('measured', '?')}` | {'yes' if run.valid else '**no**'} | {'; '.join(run.reasons()) or '–'} | "
                    f"{run.info.get('statisticsMode') or '–'} | {'–' if delay is None else f'{delay / 1000:.1f} s'} | "
                    f"{in_time} | "
                    f"{' / '.join('–' if value is None else f'{value:.0f}' for value in failed)} |")
+    out += ["", "Phase 2 first request: from the end of the evaluation (D17 log line) to the first statistics request of a tutor; "
+            "run sets before 2026-11-18 show the end of the Phase 2 setup instead.", ""]
+
+    out += ["### Achieved workload", "",
+            "Requests of each k6 run, its run time, the achieved request rate, dropped iterations, and failed requests. Phase 1 "
+            "is a closed loop per student (D35): the rates describe this cohort schedule, not the maximum throughput.", "",
+            "| Run | Phase | Requests | Run time (s) | Requests per second | Dropped iterations | Failed |", "|---|---|---|---|---|---|---|"]
+    for run in runs:
+        out += workload_rows(run)
     out.append("")
 
     if any(run.control for run in runs):
@@ -230,19 +296,37 @@ def run_set_section(folder, label, rng):
     out += duration_rows(runs, 1, PHASE1_TYPES)
     out.append("")
 
-    out += ["### Evaluation (D17)", "", "| Run | Duration |", "|---|---|"]
+    out += ["### Evaluation and time to result (D17)", "",
+            "Evaluation: the duration of `calculateAllResults` (timer log line). Time to result: from the stored due date of the "
+            "quiz (the scheduled evaluation start) until a student's result message reaches k6 over the websocket; recorded "
+            "since 2026-11-18.", "",
+            "| Run | Evaluation | Results received | Time to result median | p95 | p99 | Max |", "|---|---|---|---|---|---|---|"]
     for run in runs:
         millis = run.info.get("evaluationMillis")
-        out.append(f"| {run.name} | {'not logged' if millis is None else f'{millis / 1000:.2f} s'} |")
+        result = trend(run.phase1, "phase1_time_to_result")
+        received = count(run.phase1, "phase1_results_received")
+        n = result.get("count") or 0
+        out.append(f"| {run.name} | {'not logged' if millis is None else f'{millis / 1000:.2f} s'} | "
+                   f"{'–' if received is None else f'{received:.0f}'} | {ms(result.get('med'))} | {ms(result.get('p(95)'))} | "
+                   f"{ms(result.get('p(99)') if n >= MIN_P99 else None)} | {ms(result.get('max'))} |")
     out.append("")
 
     if has_phase2:
         out += ["### Phase 2: statistics request duration (ms)", "",
+                "initial: the first round of each tutor directly after the evaluation (5 requests per endpoint); repeated: the "
+                "other rounds, all tutors at the same time (D38 rule 4). Run sets before 2026-11-18 had no such split; their "
+                "values appear as repeated.", "",
                 "| Run | Request | n | Median | p95 | p99 | Max |", "|---|---|---|---|---|---|---|"]
-        out += duration_rows(runs, 2, PHASE2_TYPES)
+        out += phase2_rows(runs, PHASE2_TYPES)
         out += ["", "### Phase 2: page duration (ms)", "", "Time until the page data and the footer of a page are both answered.", "",
                 "| Run | Page | n | Median | p95 | p99 | Max |", "|---|---|---|---|---|---|---|"]
-        out += duration_rows(runs, 2, PAGES, prefix="phase2_page_duration{page:")
+        for run in runs:
+            for page in PAGES:
+                for read in READS:
+                    values = trend(run.phase2, f"phase2_page_duration{{page:{page},read:{read}}}") or (trend(run.phase2, f"phase2_page_duration{{page:{page}}}") if read == "repeated" else {})
+                    row = duration_row(run.name, f"{page} ({read})", values)
+                    if row:
+                        out.append(row)
         out += ["", "| Run | Phase 2 length |", "|---|---|"]
         for run in runs:
             length = (run.phase2 or {}).get("state", {}).get("testRunDurationMs")
@@ -256,28 +340,33 @@ def run_set_section(folder, label, rng):
                 "| Run | Request | n | Median | p95 | p99 | Max |", "|---|---|---|---|---|---|---|"]
         out += duration_rows(runs, 3, PHASE3_TYPES)
         out += ["", "### Phase 3: statistics freshness (ms)", "",
-                "For the n-th answered practice submission, the time until a tutor's open point statistic shows at least n new "
-                "unrated participants; one value per tutor and submission (freshness.mjs). Drain: from the last response to "
-                "the complete page, the slowest tutor.", "",
-                "| Run | Statistics | Submissions | Values (missing) | Median | p95 | p99 | Max | Drain | Websocket messages | Phase 3 length |",
-                "|---|---|---|---|---|---|---|---|---|---|---|"]
+                "An aggregate metric (D42): for the n-th answered practice submission, the time until a tutor's open point "
+                "statistic shows at least n new unrated participants; one value per tutor and submission (freshness.mjs). Values "
+                "are signed: a count can appear before the n-th response reaches k6. A value a page never showed is censored at "
+                "the deadline (a lower bound); `≥` marks a p95 among censored values. Drain: from the last response to the "
+                "complete page, the slowest tutor. POST rate: the achieved rate of practice POSTs.", "",
+                "| Run | Statistics | Submissions | Values (censored) | Min | Median | p95 | p99 | Max | Drain | Websocket messages | POST rate | Measurement |",
+                "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for run in runs:
             fresh = run.freshness
             if fresh is None:
                 continue
             drains = [value for value in fresh["drainMillis"].values() if value is not None]
             drain = "–" if len(drains) < fresh["tutors"] or not drains else f"{max(drains):.0f}"
-            length = (run.phase3 or {}).get("state", {}).get("testRunDurationMs")
-            out.append(f"| {run.name} | {run.phase3_info.get('mode') or '–'} | {fresh['submissions']} | {fresh['values']} ({fresh['missing']}) | "
-                       f"{ms(fresh['medianMillis'])} | {ms(fresh['p95Millis'])} | {ms(fresh['p99Millis'])} | {ms(fresh['maxMillis'])} | {drain} | "
-                       f"{count(run.phase3, 'phase3_messages') or 0:.0f} | {'–' if length is None else f'{length / 1000:.1f} s'} |")
+            censored = fresh.get("censored", fresh.get("missing", 0))
+            p95 = f"{'≥' if fresh.get('p95Censored') else ''}{ms(fresh['p95Millis'])}"
+            rate = fresh.get("achievedPostRate")
+            state = "complete" if fresh.get("complete", True) else f"**incomplete:** {'; '.join(fresh['errors'])}"
+            out.append(f"| {run.name} | {run.phase3_info.get('mode') or '–'} | {fresh['submissions']} | {fresh['values']} ({censored}) | "
+                       f"{ms(fresh.get('minMillis'))} | {ms(fresh['medianMillis'])} | {p95} | {ms(fresh['p99Millis'])} | {ms(fresh['maxMillis'])} | {drain} | "
+                       f"{count(run.phase3, 'phase3_messages') or 0:.0f} | {'–' if rate is None else f'{rate:.2f}/s'} | {state} |")
         out.append("")
 
     out += ["### Server, database, and k6", "",
-            "Peaks of the samples every 5 s per window: the control workflow (from its start to its end), Phases 1 and 2 (to the "
-            "start of Phase 3), and Phase 3 (to the end of the samples). Rows and CPU steal: from the snapshot before the window "
-            "to the snapshot before the next one, each 15 s after the end of the window (window 1–2: Phase 1, the evaluation, "
-            "and Phase 2).", "",
+            "Sampled maxima: the highest value among the samples every 5 s per window (control workflow, Phases 1 and 2 up to "
+            "the start of Phase 3, Phase 3); a short peak between two samples is not seen, and 0 sampled lock waits does not "
+            "prove that no lock wait happened. Rows and CPU steal: from the snapshot before the window to the snapshot before the "
+            "next one, each 15 s after the end of the window (window 1–2: Phase 1, the evaluation, and Phase 2).", "",
             "| Run | Window | Artemis CPU, memory | PostgreSQL CPU, memory | k6 CPU, memory | Lock waits | Active connections | CPU steal ticks | Rows ins / upd / del |",
             "|---|---|---|---|---|---|---|---|---|"]
     for run in runs:
@@ -290,21 +379,38 @@ def run_set_section(folder, label, rng):
     out.append("")
 
     out += ["### Side A against side B (valid runs only)", "",
-            "Median over the valid runs of each side; with at least two runs the 95% bootstrap interval over runs in brackets "
-            "(D38 rule 3). Change: B against A, from the medians.", "",
+            "Each value is computed per run first (median, p95, or p99 of the run's requests), then summarized over the valid "
+            "runs of each side: the median of the per-run values and, with at least two runs, the 95% bootstrap interval over "
+            "runs in brackets (D6, D38 rule 3). p99 only if every run has at least 100 observations. Change: B against A, from "
+            "the medians.", "",
             "| Metric | A | B | Change |", "|---|---|---|---|"]
-    valid = {side: [run for run in side_runs[side] if run.valid] for side in "AB"}
+
+    def stats_metrics(name, getter):
+        """Median, p95, and eligible p99 of a request metric; getter(run) returns the k6 trend values of that run."""
+        result = [(f"{name} median (ms)", lambda run: getter(run).get("med")), (f"{name} p95 (ms)", lambda run: getter(run).get("p(95)"))]
+        if all((getter(run).get("count") or 0) >= MIN_P99 for run in valid["A"] + valid["B"]) and valid["A"] + valid["B"]:
+            result.append((f"{name} p99 (ms)", lambda run: getter(run).get("p(99)")))
+        return result
+
     metrics = []
     if any(run.control for run in runs):
-        metrics += [(f"Control {type_.removeprefix('control-')} p95 (ms)", lambda run, t=type_: trend(run.control, f"http_req_duration{{type:{t}}}").get("p(95)")) for type_ in CONTROL_TYPES]
-    metrics += [(f"Phase 1 {type_} p95 (ms)", lambda run, t=type_: trend(run.phase1, f"http_req_duration{{type:{t}}}").get("p(95)")) for type_ in PHASE1_TYPES]
+        for type_ in CONTROL_TYPES:
+            metrics += stats_metrics(f"Control {type_.removeprefix('control-')}", lambda run, t=type_: trend(run.control, f"http_req_duration{{type:{t}}}"))
+    for type_ in PHASE1_TYPES:
+        metrics += stats_metrics(f"Phase 1 {type_}", lambda run, t=type_: trend(run.phase1, f"http_req_duration{{type:{t}}}"))
     metrics.append(("Evaluation (s)", lambda run: None if run.info.get("evaluationMillis") is None else run.info["evaluationMillis"] / 1000))
+    if any(trend(run.phase1, "phase1_time_to_result") for run in runs):
+        metrics += stats_metrics("Time to result", lambda run: trend(run.phase1, "phase1_time_to_result"))
     if has_phase2:
-        metrics += [(f"Phase 2 {type_} p95 (ms)", lambda run, t=type_: trend(run.phase2, f"http_req_duration{{type:{t}}}").get("p(95)")) for type_ in PHASE2_TYPES]
+        has_initial = any(phase2_metric(run.phase2, "statistics-points", "initial") for run in runs)
+        for type_ in PHASE2_TYPES:
+            metrics += stats_metrics(f"Phase 2 {type_} repeated", lambda run, t=type_: phase2_metric(run.phase2, t, "repeated"))
+            if has_initial:
+                metrics.append((f"Phase 2 {type_} initial median (ms)", lambda run, t=type_: phase2_metric(run.phase2, t, "initial").get("med")))
     if has_phase3:
-        metrics.append(("Phase 3 practice-submit p95 (ms)", lambda run: trend(run.phase3, "http_req_duration{type:practice-submit}").get("p(95)")))
+        metrics += stats_metrics("Phase 3 practice-submit", lambda run: trend(run.phase3, "http_req_duration{type:practice-submit}"))
         metrics.append(("Phase 3 freshness median (ms)", lambda run: (run.freshness or {}).get("medianMillis")))
-        metrics.append(("Phase 3 freshness p95 (ms)", lambda run: (run.freshness or {}).get("p95Millis")))
+        metrics.append(("Phase 3 freshness p95 (ms, lower bound if censored)", lambda run: (run.freshness or {}).get("p95Millis")))
         metrics.append(("Phase 3 rows written", lambda run: None if run.rows("pg-stat-after.csv", "pg-stat-after-phase3.csv") is None
                         else sum(run.rows("pg-stat-after.csv", "pg-stat-after-phase3.csv").values())))
     for name, value in metrics:
@@ -336,8 +442,10 @@ def main():
         parameters = load(folder / "parameters.json") or {}
         phases = "1, 2, and 3" if any(run.phase3 for run in runs) else "1 and 2" if any(run.phase2 for run in runs) else "1"
         phases = f"control, {phases}" if any(run.control for run in runs) else phases
-        overview.append(f"| {label} | {parameters.get('students')} | {phases} | "
-                        f"{sum(run.valid for run in runs)} of {len(runs)} | `{str(parameters.get('toolRevision', ''))[:11]}` | {parameters.get('startedAt')} |")
+        valid_runs = {side: sum(run.valid for run in runs if run.side == side) for side in "AB"}
+        state = "complete" if (folder / "complete.json").exists() else "pilot or incomplete"
+        overview.append(f"| {label} | {parameters.get('students')} | {phases} | {valid_runs['A']} / {valid_runs['B']} of {len(runs)} | {state} | "
+                        f"`{str(parameters.get('toolRevision', ''))[:11]}` | {parameters.get('startedAt')} |")
 
     host = load(folders[-1] / "host.json") or {}
     header = [
@@ -352,8 +460,8 @@ def main():
         "",
         "## Run sets",
         "",
-        "| Run set | Students | Phases | Valid runs | Tool revision | Started |",
-        "|---|---|---|---|---|---|",
+        "| Run set | Students | Phases | Valid runs A / B | State | Tool revision | Started |",
+        "|---|---|---|---|---|---|---|",
         *overview,
         "",
     ]
