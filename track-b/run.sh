@@ -9,26 +9,34 @@
 #                migrates forward), the last one is measured. End-to-end comparison:
 #                  artemis-thesis:43bafcee17c  artemis-thesis:9.9.3,artemis-thesis:8325896e0b4
 # Environment: REPETITIONS (5), WARMUP_STUDENTS (100), ROUNDS (20, Phase 2 rounds per tutor), WARMUP_ROUNDS (5), SEED (1),
-# SETTLE_SECONDS (15), SAMPLE_SECONDS (5), ARTEMIS_PORT (18080), and the limits of compose.yml and lib/k6-limits.sh.
+# PHASE3 (1; 0 drops Phase 3, D10, D38 rule 6), PRACTICE_RATE (10 practice submissions per second), PRACTICE_SECONDS
+# (60), DRAIN_SECONDS (300, see phase3.js), SETTLE_SECONDS (15), SAMPLE_SECONDS (5), ARTEMIS_PORT (18080), and the limits
+# of compose.yml and lib/k6-limits.sh.
 #
 # One run, in <out-folder>/<repetition>-<side>/:
 #  1. Restore the seed into fresh volumes. Start every image of the chain until it is healthy and stop it, then start the
 #     measured image again: both sides measure a fresh server on an already migrated database (starts.txt).
 #  2. Log in every user (login.mjs, D13). Warm-up on the warm-up quiz (D38 rule 5, warm-up/): Phase 1 with
-#     WARMUP_STUDENTS students, wait for its evaluation, Phase 2 with WARMUP_ROUNDS rounds, then SETTLE_SECONDS.
+#     WARMUP_STUDENTS students, wait for its evaluation, Phase 2 with WARMUP_ROUNDS rounds, Phase 3 with the warm-up
+#     students, then SETTLE_SECONDS.
 #  3. Phase 1 on the benchmark quiz with all students (phase1/: summary.json, raw.json.gz, k6.log, questions.json), while
-#     sampling every SAMPLE_SECONDS until the end of step 4: docker stats of every container of the project, PostgreSQL
+#     sampling every SAMPLE_SECONDS until the end of step 5: docker stats of every container of the project, PostgreSQL
 #     lock waits and active connections (samples.jsonl), and the Prometheus metrics of Artemis (prometheus.txt.gz).
 #  4. Wait for the evaluation by the scheduled task (D17 timer line with its timestamp: evaluation.txt), then at once
 #     Phase 2 (phase2/: the tutors load the statistics pages, D10, D16 H3), then SETTLE_SECONDS, because idle PostgreSQL
 #     backends publish their row counts up to 10 s late. pg_stat_user_tables before Phase 1 and after Phase 2
-#     (pg-stat-*.csv: Phase 1, the evaluation, and Phase 2 together) and /proc/stat of the Docker VM (CPU steal).
-#  5. D19 semantics of the benchmark quiz (semantics.json), compared with the first run (D38 rule 7).
-#  6. Server log, tear down, delete the login cookies.
-# run.json of each run records its validity (D38): all four k6 runs passed their thresholds (no failed or late request,
-# no dropped iteration, every statistics page loaded and complete), both evaluations were logged, and the semantics equal
-# those of the first run. It also records the statistics mode Phase 2 found and how long after the end of the evaluation
-# Phase 2 started. runs.tsv lists all runs.
+#     (pg-stat-before.csv, pg-stat-after.csv: Phase 1, the evaluation, and Phase 2 together) and /proc/stat of the Docker
+#     VM (CPU steal).
+#  5. Phase 3 (phase3/: practice submissions at a fixed rate while the statistics pages stay open, D10, D15), then
+#     SETTLE_SECONDS, pg-stat-after-phase3.csv and proc-stat-after-phase3.txt, and the statistics freshness
+#     (freshness.mjs: phase3/freshness.json).
+#  6. D19 semantics of the benchmark quiz (semantics.json), compared with the first run (D38 rule 7). After Phase 3 they
+#     include the practice results (unrated statistics).
+#  7. Server log, tear down, delete the login cookies.
+# run.json of each run records its validity (D38): all k6 runs passed their thresholds (no failed or late request, no
+# dropped iteration, every statistics page loaded and complete, every practice submission shown on every open page), both
+# evaluations were logged, and the semantics equal those of the first run. It also records the statistics mode Phase 2
+# found, how long after the end of the evaluation Phase 2 started, and the statistics freshness. runs.tsv lists all runs.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -48,6 +56,10 @@ warmup_rounds="${WARMUP_ROUNDS:-5}"
 schedule_seed="${SEED:-1}"
 settle="${SETTLE_SECONDS:-15}"
 sample_every="${SAMPLE_SECONDS:-5}"
+phase3="${PHASE3:-1}"
+practice_rate="${PRACTICE_RATE:-10}"
+practice_seconds="${PRACTICE_SECONDS:-60}"
+drain="${DRAIN_SECONDS:-300}"
 export ARTEMIS_PORT="${ARTEMIS_PORT:-18080}"
 server="http://localhost:$ARTEMIS_PORT"
 manifest="$seed/manifest.json"
@@ -64,7 +76,8 @@ benchmark_quiz="$(jq .benchmarkQuiz "$manifest")"
 compose "${side_a[-1]}" config --format json >"$out/compose.json"
 jq -n --arg seed "$seed" --argjson students "$students" --argjson repetitions "$repetitions" \
     --argjson warmUpStudents "$warmup_students" --argjson scheduleSeed "$schedule_seed" --argjson settleSeconds "$settle" \
-    --argjson rounds "$rounds" --argjson warmUpRounds "$warmup_rounds" \
+    --argjson rounds "$rounds" --argjson warmUpRounds "$warmup_rounds" --argjson phase3 "$([[ "$phase3" == 1 ]] && echo true || echo false)" \
+    --argjson practiceRate "$practice_rate" --argjson practiceSeconds "$practice_seconds" --argjson drainSeconds "$drain" \
     --argjson sampleSeconds "$sample_every" --arg k6Cpuset "$K6_CPUSET" --arg k6Memory "$K6_MEMORY" \
     --arg toolRevision "$(git -C "$here" rev-parse HEAD)$(git -C "$here" diff --quiet HEAD -- . || echo '-dirty')" \
     --arg startedAt "$(date -u +%FT%TZ)" \
@@ -99,10 +112,23 @@ wait_for_evaluation() {
     return 1
 }
 
-# phase_folders <folder> <manifest> <sessions>: phase1/ and phase2/ of a quiz with the inputs of the k6 scripts.
+# phase_folders <folder> <manifest> <sessions>: phase1/ to phase3/ of a quiz with the inputs of the k6 scripts.
 phase_folders() {
-    mkdir -p "$1/phase1" "$1/phase2"
-    cp "$2" "$3" "$1/phase1/" && cp "$2" "$3" "$1/phase2/"
+    local phase
+    for phase in phase1 phase2 phase3; do
+        mkdir -p "$1/$phase"
+        cp "$2" "$3" "$1/$phase/"
+    done
+}
+
+# run_phase3 <phase3-folder> <quiz> <students>: Phase 3 and its statistics freshness (freshness.json); returns the exit
+# status of k6.
+run_phase3() {
+    local folder="$1" status=0
+    "$here/k6.sh" "$project" phase3.js "$folder" -e QUIZ="$2" -e STUDENTS="$3" -e PRACTICE_RATE="$practice_rate" \
+        -e PRACTICE_SECONDS="$practice_seconds" -e DRAIN_SECONDS="$drain" >"$folder/k6.log" 2>&1 || status=$?
+    node "$here/freshness.mjs" "$folder" >>"$folder/k6.log" 2>&1 || true
+    return "$status"
 }
 
 # sample <image> <run-folder>: every SAMPLE_SECONDS (measured from the start of each sample) until <run-folder>/.stop
@@ -134,7 +160,7 @@ measure() {
     shift 2
     local images=("$@") dir="$out/$repetition-$side"
     local measured="${images[-1]}" image start evaluated=true semantics_ok=true
-    local warmup_phase1_exit=0 warmup_phase2_exit=0 phase1_exit=0 phase2_exit=0
+    local warmup_phase1_exit=0 warmup_phase2_exit=0 warmup_phase3_exit=0 phase1_exit=0 phase2_exit=0 phase3_exit=0
     mkdir -p "$dir"
 
     log "run $repetition-$side: restore, start ${images[*]}"
@@ -160,13 +186,16 @@ measure() {
     phase_folders "$dir" "$manifest" "$dir/sessions.json"
     rm "$dir/sessions.json"
 
-    log "run $repetition-$side: warm-up, $warmup_students students, $warmup_rounds statistics rounds"
+    log "run $repetition-$side: warm-up, $warmup_students students, $warmup_rounds statistics rounds, Phase 3: $phase3"
     "$here/k6.sh" "$project" phase1.js "$dir/warm-up/phase1" -e QUIZ=warmUp -e STUDENTS="$warmup_students" -e SEED="$schedule_seed" \
         >"$dir/warm-up/phase1/k6.log" 2>&1 || warmup_phase1_exit=$?
     wait_for_evaluation "$measured" "$warmup_quiz" "$dir/warm-up/evaluation.txt" || evaluated=false
     cp "$dir/warm-up/phase1/questions.json" "$dir/warm-up/phase2/" 2>/dev/null || true
     "$here/k6.sh" "$project" phase2.js "$dir/warm-up/phase2" -e QUIZ=warmUp -e STUDENTS="$warmup_students" \
         -e ROUNDS="$warmup_rounds" -e SEED="$schedule_seed" >"$dir/warm-up/phase2/k6.log" 2>&1 || warmup_phase2_exit=$?
+    if [[ "$phase3" == 1 ]]; then
+        run_phase3 "$dir/warm-up/phase3" warmUp "$warmup_students" || warmup_phase3_exit=$?
+    fi
     sleep "$settle"
 
     log "run $repetition-$side: Phase 1, $students students"
@@ -183,13 +212,20 @@ measure() {
     "$here/k6.sh" "$project" phase2.js "$dir/phase2" -e QUIZ=benchmark -e STUDENTS="$students" -e ROUNDS="$rounds" \
         -e SEED="$schedule_seed" >"$dir/phase2/k6.log" 2>&1 || phase2_exit=$?
     sleep "$settle"
+    pg_stat "$measured" >"$dir/pg-stat-after.csv"
+    compose "$measured" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-after.txt"
+    if [[ "$phase3" == 1 ]]; then
+        log "run $repetition-$side: Phase 3, $practice_rate practice submissions per second for at most $practice_seconds s"
+        run_phase3 "$dir/phase3" benchmark "$students" || phase3_exit=$?
+        sleep "$settle"
+        pg_stat "$measured" >"$dir/pg-stat-after-phase3.csv"
+        compose "$measured" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-after-phase3.txt"
+    fi
     touch "$dir/.stop"
     wait "$sampler_pid" || true
     sampler_pid=""
     rm "$dir/.stop"
     [[ ! -e "$dir/prometheus.txt" ]] || gzip "$dir/prometheus.txt"
-    pg_stat "$measured" >"$dir/pg-stat-after.csv"
-    compose "$measured" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-after.txt"
 
     log "run $repetition-$side: semantics"
     node "$here/semantics.mjs" --manifest "$manifest" --server "$server" --quiz benchmark --students "$students" \
@@ -209,24 +245,29 @@ measure() {
     fi
     # The end of the evaluation (timestamp of the D17 line) and the start of Phase 2 (phase2.json) come from the same
     # Docker VM clock.
-    local evaluation_millis=null evaluation_end=null phase2_setup=null
+    local evaluation_millis=null evaluation_end=null phase2_setup=null freshness=null
     if [[ "$evaluated" == true ]]; then
         evaluation_millis="$(sed -E 's/.*durationMillis=([0-9]+).*/\1/' "$dir/evaluation.txt")"
         evaluation_end="$(node -e 'console.log(Date.parse(process.argv[1]))' "$(grep -m1 -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' "$dir/evaluation.txt")")"
     fi
     [[ ! -e "$dir/phase2/phase2.json" ]] || phase2_setup="$(cat "$dir/phase2/phase2.json")"
+    [[ ! -e "$dir/phase3/freshness.json" ]] || freshness="$(cat "$dir/phase3/freshness.json")"
     jq -n --argjson repetition "$repetition" --arg side "$side" --arg measured "$measured" \
         --argjson warmUpPhase1Exit "$warmup_phase1_exit" --argjson warmUpPhase2Exit "$warmup_phase2_exit" \
-        --argjson phase1Exit "$phase1_exit" --argjson phase2Exit "$phase2_exit" --argjson evaluated "$evaluated" \
+        --argjson warmUpPhase3Exit "$warmup_phase3_exit" --argjson phase1Exit "$phase1_exit" --argjson phase2Exit "$phase2_exit" \
+        --argjson phase3Exit "$phase3_exit" --argjson evaluated "$evaluated" \
         --argjson evaluationMillis "$evaluation_millis" --argjson evaluationEnd "$evaluation_end" \
-        --argjson phase2 "$phase2_setup" --argjson semanticsEqual "$semantics_ok" \
+        --argjson phase2 "$phase2_setup" --argjson freshness "$freshness" --argjson semanticsEqual "$semantics_ok" \
+        --argjson phase3Run "$([[ "$phase3" == 1 ]] && echo true || echo false)" \
         '$ARGS.named + {
             statisticsMode: $phase2.mode,
             phase2DelayMillis: (if $phase2.start and $evaluationEnd then $phase2.start - $evaluationEnd else null end),
-            valid: ($warmUpPhase1Exit == 0 and $warmUpPhase2Exit == 0 and $phase1Exit == 0 and $phase2Exit == 0
-                and $evaluated and $semanticsEqual)
-        } | del(.phase2)' >"$dir/run.json"
-    log "run $repetition-$side: $(jq -c '{valid, warmUpPhase1Exit, warmUpPhase2Exit, phase1Exit, phase2Exit, evaluationMillis, statisticsMode, phase2DelayMillis, semanticsEqual}' "$dir/run.json")"
+            freshnessMedianMillis: $freshness.medianMillis,
+            freshnessP95Millis: $freshness.p95Millis,
+            valid: ($warmUpPhase1Exit == 0 and $warmUpPhase2Exit == 0 and $warmUpPhase3Exit == 0 and $phase1Exit == 0
+                and $phase2Exit == 0 and $phase3Exit == 0 and $evaluated and $semanticsEqual)
+        } | del(.phase2, .freshness)' >"$dir/run.json"
+    log "run $repetition-$side: $(jq -c '{valid, warmUpPhase1Exit, warmUpPhase2Exit, warmUpPhase3Exit, phase1Exit, phase2Exit, phase3Exit, evaluationMillis, statisticsMode, phase2DelayMillis, freshnessP95Millis, semanticsEqual}' "$dir/run.json")"
 }
 
 for repetition in $(seq "$repetitions"); do
@@ -235,20 +276,24 @@ for repetition in $(seq "$repetitions"); do
 done
 
 {
-    printf 'run\tmeasured\tvalid\tstart-participation p95 ms\tsave p95 ms\tsubmit p95 ms\tevaluation ms\tstatistics\toverview p95 ms\tpoints p95 ms\tquestion p95 ms\n'
+    printf 'run\tmeasured\tvalid\tstart-participation p95 ms\tsave p95 ms\tsubmit p95 ms\tevaluation ms\tstatistics\toverview p95 ms\tpoints p95 ms\tquestion p95 ms\tpractice-submit p95 ms\tfreshness p95 ms\n'
     for run in $(seq "$repetitions"); do
         for side in A B; do
             dir="$out/$run-$side"
             phase1="$dir/phase1/summary.json"
             phase2="$dir/phase2/summary.json"
+            phase3="$dir/phase3/summary.json"
             [[ -e "$phase1" ]] || phase1=/dev/null
             [[ -e "$phase2" ]] || phase2=/dev/null
-            jq -rn --arg run "$run-$side" --slurpfile r "$dir/run.json" --slurpfile p1 "$phase1" --slurpfile p2 "$phase2" '
-                def p95($summary; $type): ($summary[0].metrics["http_req_duration{type:\($type)}"].values["p(95)"] // null)
-                    | if . == null then "-" else (. * 10 | round / 10 | tostring) end;
+            [[ -e "$phase3" ]] || phase3=/dev/null
+            jq -rn --arg run "$run-$side" --slurpfile r "$dir/run.json" --slurpfile p1 "$phase1" --slurpfile p2 "$phase2" \
+                --slurpfile p3 "$phase3" '
+                def round1: if . == null then "-" else (. * 10 | round / 10 | tostring) end;
+                def p95($summary; $type): $summary[0].metrics["http_req_duration{type:\($type)}"].values["p(95)"] // null | round1;
                 [$run, $r[0].measured, ($r[0].valid | tostring), p95($p1; "start-participation"), p95($p1; "save"),
                     p95($p1; "submit"), ($r[0].evaluationMillis // "-" | tostring), ($r[0].statisticsMode // "-"),
-                    p95($p2; "statistics-overview"), p95($p2; "statistics-points"), p95($p2; "statistics-question")] | @tsv'
+                    p95($p2; "statistics-overview"), p95($p2; "statistics-points"), p95($p2; "statistics-question"),
+                    p95($p3; "practice-submit"), ($r[0].freshnessP95Millis | round1)] | @tsv'
         done
     done
 } >"$out/runs.tsv"

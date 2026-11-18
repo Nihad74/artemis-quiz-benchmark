@@ -1,7 +1,30 @@
 /**
- * Helpers shared by the Track B k6 scripts (phase1.js, phase2.js). k6 runtime only.
+ * Helpers shared by the Track B k6 scripts (phase1.js, phase2.js, phase3.js). k6 runtime only.
  */
 import http from 'k6/http';
+
+/**
+ * Where the measured commit keeps its statistics: 'stored' (43bafcee17c, f3463b75408, c136826e299: the statistics come
+ * with the quiz) or 'on-demand' (24a062759c2, 8325896e0b4: statistics endpoints). Asks the points endpoint of the warm-up
+ * quiz, not of the measured quiz, so that the measured statistics are not loaded early: 404 means stored statistics.
+ */
+export function statisticsMode(server, session, warmUpQuiz) {
+    const probeParams = params(session, { type: 'setup' });
+    // 404 is an expected answer here (stored statistics), not a failed request.
+    probeParams.responseCallback = http.expectedStatuses(200, 404);
+    const probe = http.get(`${server}/api/quiz/quiz-exercises/${warmUpQuiz}/statistics/points`, probeParams);
+    if (probe.status !== 200 && probe.status !== 404) {
+        throw new Error(`statistics probe on the warm-up quiz ${warmUpQuiz}: HTTP ${probe.status}`);
+    }
+    return probe.status === 200 ? 'on-demand' : 'stored';
+}
+
+/** The Cookie header of a session, for requests that do not use the cookie jar (the websocket handshake). */
+export function cookieHeader(session) {
+    return Object.entries(session.cookies)
+        .map(([name, value]) => `${name}=${value}`)
+        .join('; ');
+}
 
 /** Request parameters for a logged-in session: JSON headers, the XSRF token, the tags, and how k6 keeps the body. */
 export function params(session, tags, responseType = 'none') {

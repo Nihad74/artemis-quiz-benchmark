@@ -39,6 +39,24 @@ export function submission(questions, variant) {
     return { submissionExerciseType: 'quiz', submittedAnswers };
 }
 
+/**
+ * The same answers in the form of the practice endpoint (QuizSubmissionFromStudentDTO, the same on every compared commit):
+ * ids instead of nested components.
+ */
+export function practiceSubmission(questions, variant) {
+    const submittedAnswers = submission(questions, variant).submittedAnswers.map((answer) => {
+        const questionId = answer.quizQuestion.id;
+        if (answer.type === 'multiple-choice') {
+            return { type: answer.type, questionId, selectedOptions: answer.selectedOptions.map((option) => option.id) };
+        }
+        if (answer.type === 'drag-and-drop') {
+            return { type: answer.type, questionId, mappings: answer.mappings.map((mapping) => ({ dragItemId: mapping.dragItem.id, dropLocationId: mapping.dropLocation.id })) };
+        }
+        return { type: answer.type, questionId, submittedTexts: answer.submittedTexts.map((text) => ({ text: text.text, spotId: text.spot.id })) };
+    });
+    return { submittedAnswers };
+}
+
 function sortBy(list, key) {
     return [...list].sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
 }

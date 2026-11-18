@@ -7,8 +7,10 @@ statistics calculated on demand (`8325896e0b4`).
 ## Track B: runtime benchmark
 
 `track-b/` measures one synchronized live quiz under load with [k6](https://k6.io): students join, save, and submit
-(Phase 1); after the evaluation, tutors open the statistics pages (Phase 2). Both commits run in the same server image,
-on the same seeded and migrated database, with fixed CPU sets and memory limits.
+(Phase 1); after the evaluation, tutors open the statistics pages (Phase 2); then students practise at a fixed rate while
+the tutors keep the statistics open, and `freshness.mjs` measures how fast the open pages show each practice result
+(Phase 3). Both commits run in the same server image, on the same seeded and migrated database, with fixed CPU sets and
+memory limits.
 
 | Script | Purpose |
 |---|---|

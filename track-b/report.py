@@ -4,10 +4,11 @@
 Usage: python3 report.py --out results.md <run-set> [<run-set> ...]
 
 A run set is one run.sh output folder (parameters.json, <repetition>-<side>/). The report lists, per run set, the
-validity of every run (D38), the request durations of Phase 1 and Phase 2 (k6 summaries), the evaluation duration (D17),
-the resources of the containers, and the written rows; then side A against side B over the valid runs only. With at
-least two valid runs per side it adds a 95% bootstrap confidence interval of the median over runs (D6, D38 rule 3);
-with fewer, the value of the single run. p99 is shown only with at least 100 observations (D38 rule 4).
+validity of every run (D38), the request durations of Phases 1 to 3 (k6 summaries), the evaluation duration (D17), the
+statistics freshness of Phase 3 (freshness.json), the resources of the containers, and the written rows; then side A
+against side B over the valid runs only. With at least two valid runs per side it adds a 95% bootstrap confidence
+interval of the median over runs (D6, D38 rule 3); with fewer, the value of the single run. p99 is shown only with at
+least 100 observations (D38 rule 4).
 
 Run sets with fewer than 5 runs per side are pilots (D6); the report says so. Standard library only.
 """
@@ -25,6 +26,7 @@ from pathlib import Path
 
 PHASE1_TYPES = ["start-participation", "save", "submit"]
 PHASE2_TYPES = ["statistics-overview", "statistics-points", "statistics-question", "statistics-footer"]
+PHASE3_TYPES = ["practice-load", "practice-submit", "statistics-open", "statistics-reload"]
 PAGES = ["overview", "points", "question"]
 MIN_RUNS = 5  # D6
 MIN_P99 = 100  # D38 rule 4
@@ -74,7 +76,17 @@ class Run:
         self.info = load(folder / "run.json") or {}
         self.phase1 = load(folder / "phase1" / "summary.json")
         self.phase2 = load(folder / "phase2" / "summary.json")
+        self.phase3 = load(folder / "phase3" / "summary.json")
+        self.phase3_info = load(folder / "phase3" / "phase3.json") or {}
+        self.freshness = load(folder / "phase3" / "freshness.json")
         self.parameters = parameters
+
+    def window(self, phase3):
+        """The sample times (s) of Phases 1 and 2 (phase3 False) or of Phase 3, split at the start of Phase 3."""
+        start = self.phase3_info.get("start")
+        if not start:
+            return (float("-inf"), float("inf")) if not phase3 else None
+        return (start / 1000, float("inf")) if phase3 else (float("-inf"), start / 1000)
 
     @property
     def valid(self):
@@ -88,12 +100,14 @@ class Run:
             reasons.append("semantics differ from 1-A")
         return reasons
 
-    def resources(self, limits):
+    def resources(self, limits, window):
         peaks = {}
         locks = active = 0
         samples = self.folder / "samples.jsonl"
         for line in samples.read_text().splitlines() if samples.exists() else []:
             sample = json.loads(line)
+            if not window[0] <= sample["time"] < window[1]:
+                continue
             locks = max(locks, sample.get("lockWaits", 0))
             active = max(active, sample.get("activeConnections", 0))
             for container in sample["containers"]:
@@ -109,8 +123,8 @@ class Run:
                 cells.append("–")
         return cells, locks, active
 
-    def rows(self):
-        before, after = self.folder / "pg-stat-before.csv", self.folder / "pg-stat-after.csv"
+    def rows(self, before="pg-stat-before.csv", after="pg-stat-after.csv"):
+        before, after = self.folder / before, self.folder / after
         if not (before.exists() and after.exists()):
             return None
         old = {row["relname"]: row for row in csv.DictReader(before.open())}
@@ -120,8 +134,8 @@ class Run:
                 totals[key] = totals.get(key, 0) + int(row[key]) - int(old.get(row["relname"], {key: 0})[key])
         return totals
 
-    def steal(self):
-        before, after = self.folder / "proc-stat-before.txt", self.folder / "proc-stat-after.txt"
+    def steal(self, before="proc-stat-before.txt", after="proc-stat-after.txt"):
+        before, after = self.folder / before, self.folder / after
         if not (before.exists() and after.exists()):
             return None
         first, last = (list(map(int, path.read_text().split()[1:])) for path in (before, after))
@@ -143,13 +157,13 @@ def median_with_interval(values, rng):
 def duration_rows(runs, phase, types, prefix="http_req_duration{type:", suffix="}"):
     lines = []
     for run in runs:
-        summary = run.phase1 if phase == 1 else run.phase2
+        summary = {1: run.phase1, 2: run.phase2, 3: run.phase3}[phase]
         if summary is None:
             continue
         for type_ in types:
             values = trend(summary, f"{prefix}{type_}{suffix}")
             n = values.get("count")
-            if n is None:
+            if not n:
                 continue
             p99 = values.get("p(99)") if n >= MIN_P99 else None
             lines.append(f"| {run.name} | {type_} | {n:.0f} | {ms(values.get('med'))} | {ms(values.get('p(95)'))} | {ms(p99)} | {ms(values.get('max'))} |")
@@ -164,10 +178,14 @@ def run_set_section(folder, label, rng):
     if parameters.get("k6Cpuset"):
         limits["k6"] = cpus(parameters["k6Cpuset"])
     has_phase2 = any(run.phase2 for run in runs)
+    has_phase3 = any(run.phase3 for run in runs)
     side_runs = {side: [run for run in runs if run.side == side] for side in "AB"}
     out = [f"## {label}", ""]
+    phase3 = (f"{parameters.get('practiceRate')} practice submissions per second for at most {parameters.get('practiceSeconds')} s"
+              if parameters.get("phase3") else "– (not run)")
     out.append(f"Folder `{folder}`. Students: {parameters.get('students')}. Repetitions: {parameters.get('repetitions')}. "
-               f"Phase 2 rounds: {parameters.get('rounds', '– (no Phase 2)')}. Warm-up: {parameters.get('warmUpStudents')} students. "
+               f"Phase 2 rounds: {parameters.get('rounds', '– (no Phase 2)')}. Phase 3: {phase3}. "
+               f"Warm-up: {parameters.get('warmUpStudents')} students. "
                f"Schedule seed: {parameters.get('scheduleSeed')}. Tool revision `{str(parameters.get('toolRevision', ''))[:11]}`. "
                f"Started {parameters.get('startedAt')}.")
     out.append("")
@@ -177,12 +195,12 @@ def run_set_section(folder, label, rng):
         out.append(f"- **Pilot:** fewer than {MIN_RUNS} runs per side (D6). The numbers are for orientation only; they are no result set.")
     out.append("")
 
-    out += ["### Runs", "", "| Run | Measured | Valid | Reasons | Statistics | Phase 2 delay | Submissions in time | Failed requests (Phase 1 / Phase 2) |", "|---|---|---|---|---|---|---|---|"]
+    out += ["### Runs", "", "| Run | Measured | Valid | Reasons | Statistics | Phase 2 delay | Submissions in time | Failed requests (Phase 1 / 2 / 3) |", "|---|---|---|---|---|---|---|---|"]
     for run in runs:
         delay = run.info.get("phase2DelayMillis")
         submitted = count(run.phase1, "phase1_submitted_in_time")
         in_time = "–" if submitted is None else f"{submitted:.0f} of {parameters.get('students')}"
-        failed = [count(summary, "http_req_failed", "passes") for summary in (run.phase1, run.phase2)]
+        failed = [count(summary, "http_req_failed", "passes") for summary in (run.phase1, run.phase2, run.phase3)]
         out.append(f"| {run.name} | `{run.info.get('measured', '?')}` | {'yes' if run.valid else '**no**'} | {', '.join(run.reasons()) or '–'} | "
                    f"{run.info.get('statisticsMode') or '–'} | {'–' if delay is None else f'{delay / 1000:.1f} s'} | "
                    f"{in_time} | "
@@ -213,16 +231,45 @@ def run_set_section(folder, label, rng):
             out.append(f"| {run.name} | {'–' if length is None else f'{length / 1000:.1f} s'} |")
         out.append("")
 
+    if has_phase3:
+        out += ["### Phase 3: request duration (ms)", "",
+                "statistics-open: the page data when a tutor opens the point statistic; statistics-reload: the reloads after "
+                "each notification (on-demand statistics only; stored statistics come with the websocket message).", "",
+                "| Run | Request | n | Median | p95 | p99 | Max |", "|---|---|---|---|---|---|---|"]
+        out += duration_rows(runs, 3, PHASE3_TYPES)
+        out += ["", "### Phase 3: statistics freshness (ms)", "",
+                "For the n-th answered practice submission, the time until a tutor's open point statistic shows at least n new "
+                "unrated participants; one value per tutor and submission (freshness.mjs). Drain: from the last response to "
+                "the complete page, the slowest tutor.", "",
+                "| Run | Statistics | Submissions | Values (missing) | Median | p95 | p99 | Max | Drain | Websocket messages | Phase 3 length |",
+                "|---|---|---|---|---|---|---|---|---|---|---|"]
+        for run in runs:
+            fresh = run.freshness
+            if fresh is None:
+                continue
+            drains = [value for value in fresh["drainMillis"].values() if value is not None]
+            drain = "–" if len(drains) < fresh["tutors"] or not drains else f"{max(drains):.0f}"
+            length = (run.phase3 or {}).get("state", {}).get("testRunDurationMs")
+            out.append(f"| {run.name} | {run.phase3_info.get('mode') or '–'} | {fresh['submissions']} | {fresh['values']} ({fresh['missing']}) | "
+                       f"{ms(fresh['medianMillis'])} | {ms(fresh['p95Millis'])} | {ms(fresh['p99Millis'])} | {ms(fresh['maxMillis'])} | {drain} | "
+                       f"{count(run.phase3, 'phase3_messages') or 0:.0f} | {'–' if length is None else f'{length / 1000:.1f} s'} |")
+        out.append("")
+
     out += ["### Server, database, and k6", "",
-            "Peaks of the samples every 5 s from the start of Phase 1 to the end of the last phase. Rows: `pg_stat_user_tables` "
-            "between the start of Phase 1 and 15 s after the last phase (all phases and the evaluation together).", "",
-            "| Run | Artemis CPU, memory | PostgreSQL CPU, memory | k6 CPU, memory | Lock waits | Active connections | CPU steal ticks | Rows ins / upd / del |",
-            "|---|---|---|---|---|---|---|---|"]
+            "Peaks of the samples every 5 s, from the start of Phase 1 to the start of Phase 3 (window 1–2) and from the start "
+            "of Phase 3 to the end of the samples (window 3). Rows: `pg_stat_user_tables` between the start of Phase 1 and "
+            "15 s after Phase 2 (window 1–2: Phase 1, the evaluation, and Phase 2), and from there to 15 s after Phase 3.", "",
+            "| Run | Window | Artemis CPU, memory | PostgreSQL CPU, memory | k6 CPU, memory | Lock waits | Active connections | CPU steal ticks | Rows ins / upd / del |",
+            "|---|---|---|---|---|---|---|---|---|"]
     for run in runs:
-        cells, locks, active = run.resources(limits)
-        rows = run.rows()
-        written = "–" if rows is None else f"{rows['n_tup_ins']} / {rows['n_tup_upd']} / {rows['n_tup_del']}"
-        out.append(f"| {run.name} | {' | '.join(cells)} | {locks} | {active} | {run.steal()} | {written} |")
+        windows = [("1–2", run.window(False), ("pg-stat-before.csv", "pg-stat-after.csv"), ("proc-stat-before.txt", "proc-stat-after.txt"))]
+        if run.window(True):
+            windows.append(("3", run.window(True), ("pg-stat-after.csv", "pg-stat-after-phase3.csv"), ("proc-stat-after.txt", "proc-stat-after-phase3.txt")))
+        for label, window, pg, proc in windows:
+            cells, locks, active = run.resources(limits, window)
+            rows = run.rows(*pg)
+            written = "–" if rows is None else f"{rows['n_tup_ins']} / {rows['n_tup_upd']} / {rows['n_tup_del']}"
+            out.append(f"| {run.name} | {label} | {' | '.join(cells)} | {locks} | {active} | {run.steal(*proc)} | {written} |")
     out.append("")
 
     out += ["### Side A against side B (valid runs only)", "",
@@ -234,6 +281,12 @@ def run_set_section(folder, label, rng):
     metrics.append(("Evaluation (s)", lambda run: None if run.info.get("evaluationMillis") is None else run.info["evaluationMillis"] / 1000))
     if has_phase2:
         metrics += [(f"Phase 2 {type_} p95 (ms)", lambda run, t=type_: trend(run.phase2, f"http_req_duration{{type:{t}}}").get("p(95)")) for type_ in PHASE2_TYPES]
+    if has_phase3:
+        metrics.append(("Phase 3 practice-submit p95 (ms)", lambda run: trend(run.phase3, "http_req_duration{type:practice-submit}").get("p(95)")))
+        metrics.append(("Phase 3 freshness median (ms)", lambda run: (run.freshness or {}).get("medianMillis")))
+        metrics.append(("Phase 3 freshness p95 (ms)", lambda run: (run.freshness or {}).get("p95Millis")))
+        metrics.append(("Phase 3 rows written", lambda run: None if run.rows("pg-stat-after.csv", "pg-stat-after-phase3.csv") is None
+                        else sum(run.rows("pg-stat-after.csv", "pg-stat-after-phase3.csv").values())))
     for name, value in metrics:
         per_side = {side: [v for v in (value(run) for run in valid[side]) if v is not None] for side in "AB"}
         change = "–"
@@ -261,14 +314,15 @@ def main():
         lines, runs = run_set_section(folder, label, rng)
         sections += lines
         parameters = load(folder / "parameters.json") or {}
-        overview.append(f"| {label} | {parameters.get('students')} | {'1 and 2' if any(run.phase2 for run in runs) else '1'} | "
+        phases = "1, 2, and 3" if any(run.phase3 for run in runs) else "1 and 2" if any(run.phase2 for run in runs) else "1"
+        overview.append(f"| {label} | {parameters.get('students')} | {phases} | "
                         f"{sum(run.valid for run in runs)} of {len(runs)} | `{str(parameters.get('toolRevision', ''))[:11]}` | {parameters.get('startedAt')} |")
 
     host = load(folders[-1] / "host.json") or {}
     header = [
         "# Quiz Module Benchmark: Track B Results",
         "",
-        f"Generated by `thesis/benchmark/track_b/report.py` (revision `{revision}`) on "
+        f"Generated by `track-b/report.py` of `github.com/Nihad74/artemis-quiz-benchmark` (revision `{revision}`) on "
         f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC from the run folders below. Do not edit by hand; run the "
         "script again after new runs. Setup and methods: `quiz-benchmark-track-b-setup.md`; decisions: `quiz-benchmark-decisions.md`.",
         "",

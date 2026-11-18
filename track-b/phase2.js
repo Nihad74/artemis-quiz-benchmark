@@ -34,7 +34,7 @@ import { SharedArray } from 'k6/data';
 import exec from 'k6/execution';
 import http from 'k6/http';
 import { Counter, Trend } from 'k6/metrics';
-import { failedThresholds, params, prng, trendLine, useSession } from './lib/k6.js';
+import { failedThresholds, params, prng, statisticsMode, trendLine, useSession } from './lib/k6.js';
 
 const SERVER = __ENV.SERVER;
 const OUT = __ENV.OUT;
@@ -94,14 +94,11 @@ export const options = {
 
 export function setup() {
     useSession(SERVER, sessions.instructor);
-    const probeParams = params(sessions.instructor, { type: 'setup' });
-    // 404 is an expected answer here (stored statistics), not a failed request.
-    probeParams.responseCallback = http.expectedStatuses(200, 404);
-    const probe = http.get(`${SERVER}/api/quiz/quiz-exercises/${config.warmUpQuiz}/statistics/points`, probeParams);
-    if (probe.status !== 200 && probe.status !== 404) {
-        fail(`statistics probe on the warm-up quiz ${config.warmUpQuiz}: HTTP ${probe.status}`);
+    try {
+        return { mode: statisticsMode(SERVER, sessions.instructor, config.warmUpQuiz), start: Date.now() };
+    } catch (error) {
+        fail(error.message);
     }
-    return { mode: probe.status === 200 ? 'on-demand' : 'stored', start: Date.now() };
 }
 
 /** The data request of a page: what the page component of the measured commit loads. */
