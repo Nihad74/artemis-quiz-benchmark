@@ -8,8 +8,8 @@
 # <scale>.attempt-<time> and kept; the scale is measured again from its first run. Needs Bash 5.
 #
 # Usage: night.sh <comparison> [<students>...]
-#   comparison  e2e (43bafcee17c against 9.9.3 -> 8325896e0b4), json-answers (43bafcee17c against f3463b75408, without
-#               Phase 3), or stats-on-demand (c136826e299 against 24a062759c2); D37, D40
+#   comparison  e2e (43bafcee17c against 9.9.3 -> 8325896e0b4; H2 and the end-to-end view) or stats-on-demand
+#               (c136826e299 against 24a062759c2; H3); D37, D40, D45
 #   students    the scales, default 100 500 1000 2000
 # Environment: SEED_FOLDER (default ~/Documents/thesis-benchmark-results/track-b/seed-2000-2026-11-18), RESULTS (default
 # ~/Documents/thesis-benchmark-results/track-b/mac; run sets go to RESULTS/<comparison>/s<students>), NIGHT_CHECK=1 (only
@@ -44,15 +44,14 @@ scales=("$@")
 ((${#scales[@]} > 0)) || scales=(100 500 1000 2000)
 seed="${SEED_FOLDER:-$HOME/Documents/thesis-benchmark-results/track-b/seed-2000-2026-11-18}"
 results="${RESULTS:-$HOME/Documents/thesis-benchmark-results/track-b/mac}"
-all_images=(artemis-thesis:43bafcee17c artemis-thesis:9.9.3 artemis-thesis:8325896e0b4 artemis-thesis:f3463b75408
+all_images=(artemis-thesis:43bafcee17c artemis-thesis:9.9.3 artemis-thesis:8325896e0b4
     artemis-thesis:c136826e299 artemis-thesis:24a062759c2)
 
 case "$comparison" in
     e2e) side_a=artemis-thesis:43bafcee17c side_b=artemis-thesis:9.9.3,artemis-thesis:8325896e0b4 phase3=1 ;;
-    json-answers) side_a=artemis-thesis:43bafcee17c side_b=artemis-thesis:f3463b75408 phase3=0 ;;
     stats-on-demand) side_a=artemis-thesis:c136826e299 side_b=artemis-thesis:24a062759c2 phase3=1 ;;
     *)
-        echo "comparison must be e2e, json-answers, or stats-on-demand, not $comparison" >&2
+        echo "comparison must be e2e or stats-on-demand, not $comparison" >&2
         exit 2
         ;;
 esac

@@ -46,8 +46,9 @@ BOOTSTRAP = 10_000
 VERDICT_STUDENTS = 2000  # D16
 H3_PRACTICE_RATE = 10  # D42
 PRACTICE_RATE_TOLERANCE = 0.05  # D43
-# D37: the targeted pair whose result set decides the hypothesis.
-HYPOTHESIS_PAIRS = {"H2": ("43bafcee17c", "f3463b75408"), "H3": ("c136826e299", "24a062759c2")}
+# The comparison whose result set decides the hypothesis: H2 the end-to-end comparison (D45; the targeted pair
+# 43bafcee17c -> f3463b75408 is dropped), H3 the targeted pair of D37.
+HYPOTHESIS_PAIRS = {"H2": ("43bafcee17c", "8325896e0b4"), "H3": ("c136826e299", "24a062759c2")}
 
 
 def commit_of(chain):
@@ -529,11 +530,13 @@ def run_set_section(folder, label, rng):
         out.append(f"| {name} | {median_with_interval(per_side['A'], rng)} | {median_with_interval(per_side['B'], rng)} | {change} |")
     out.append("")
 
-    out += ["### Hypothesis checks (D16, D44)", "",
-            f"A verdict only for a result set of the targeted pair of the hypothesis (D37: `43bafcee17c` → `f3463b75408` for H2, "
-            f"`c136826e299` → `24a062759c2` for H3) at {VERDICT_STUDENTS} students (D16). Every other run set shows the values "
-            "as an illustration, without a verdict; the end-to-end comparison shows version differences, not the effect of a "
-            "commit. Server failures remain separate regression evidence, never completed latency samples. H2: ratio B/A "
+    out += ["### Hypothesis checks (D16, D44, D45)", "",
+            f"A verdict only for a result set of the comparison of the hypothesis at {VERDICT_STUDENTS} students (D16, D45): "
+            f"H2 from the end-to-end comparison `43bafcee17c` → `8325896e0b4` (the complete refactoring against the relational "
+            f"baseline; a difference between two versions, including unrelated drift, which the control workflow indicates), "
+            f"H3 from the targeted pair `c136826e299` → `24a062759c2` (D37). Every other run set shows the values as an "
+            "illustration, without a verdict. Server failures remain separate regression evidence, never completed latency "
+            "samples. H2: ratio B/A "
             "of the per-run submit p95 over five valid runs per side, 95% bootstrap interval; holds "
             "if the upper limit is at most 1.10. H3 statistics: the initial reads of Phase 2, directly after the evaluation "
             "(D16; each tutor's first round, 5 observations of the overview and the points page and 50 of the question pages "

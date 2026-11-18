@@ -237,9 +237,9 @@ mv "$work/fresh.json" "$out/1-B/phase3/freshness.json"
 judge "$out" 1-B
 expect "an independent capture error remains invalid despite rejected POSTs" "$(field "$out" 1-B .outcome)" invalid
 
-# 8. Replay the saved f3463b75408 workload failure. Its latencies cannot complete a result set. The historical pilot lacks
-#    container facts, so the fixture supplies matching synthetic facts. Only outcome classification is replayed;
-#    this is not new provenance evidence.
+# 8. Replay the saved f3463b75408 workload failure (the dropped H2 pair, D45): the judge still classifies a collapse as a
+#    server failure whose latencies cannot complete a result set. The historical pilot lacks container facts, so the
+#    fixture supplies matching synthetic facts. Only outcome classification is replayed; this is no new provenance.
 replay="$work/replay"
 mkdir -p "$replay"
 jq --argjson settings "$settings" '.settings = $settings | .repetitions = 5 | .images[.sideA[-1]] = "sha256:abc" | .images[.sideB[-1]] = "sha256:abc"' \
@@ -267,9 +267,9 @@ node "$here/judge.mjs" complete "$replay" 5 >/dev/null || status=$?
 expect "five server failures remain evidence, never five valid runs" "$status/$(exists "$replay/complete.json")/$(exists "$replay/failure.json")" 1/no/yes
 python3 "$here/report.py" --out "$work/replay.md" "$replay" >/dev/null
 expect "failure evidence gets no latency verdict" \
-    "$(grep -c '^| H2 submit p95 B/A .*side B failed 5 of 5.*no verdict (incomplete)' "$work/replay.md")" 1
+    "$(grep -c '^| H2 submit p95 B/A .*side B failed 5 of 5.*no verdict (.*incomplete)' "$work/replay.md")" 1
 
-# 9. Report verdicts only for a result set of the targeted pair at 2000 students (D16, D37, D44).
+# 9. Report verdicts only for a result set of the comparison of the hypothesis at 2000 students (D16, D37, D44, D45).
 stats="$final/stats-on-demand/s2000"
 fake_set() {
     local out="$1" students="$2" repetitions="$3" repetition side
@@ -297,6 +297,14 @@ expect "the H3 pair gives verdicts from a 2000-student result set" \
 expect "H3 reads the initial reads, 5 overview observations per run" \
     "$(grep -c '^| H3 statistics-overview initial p95 (ms) | [0-9.]* | 5 | < 1000 | holds |' "$work/s2000.md")" 1
 expect "the H3 pair gives no H2 verdict" "$(grep -c '^| H2 .*no verdict (not the H2 pair)' "$work/s2000.md")" 1
+jq '.sideA = ["artemis-thesis:43bafcee17c"] | .sideB = ["artemis-thesis:9.9.3", "artemis-thesis:8325896e0b4"]' \
+    "$work/s2000/parameters.json" >"$work/e2e-parameters.json"
+cp "$work/s2000/parameters.json" "$work/h3-parameters.json"
+mv "$work/e2e-parameters.json" "$work/s2000/parameters.json"
+python3 "$here/report.py" --out "$work/e2e.md" "$work/s2000" >/dev/null
+expect "the end-to-end comparison decides H2 and gives no H3 verdict (D45)" \
+    "$(grep -c '^| H2 .*no verdict' "$work/e2e.md")/$(grep -c '^| H3 .*no verdict (not the H3 pair)' "$work/e2e.md")" 0/4
+mv "$work/h3-parameters.json" "$work/s2000/parameters.json"
 jq '.practiceRate = 5' "$work/s2000/parameters.json" >"$work/report-parameters.json"
 mv "$work/report-parameters.json" "$work/s2000/parameters.json"
 python3 "$here/report.py" --out "$work/wrong-rate.md" "$work/s2000" >/dev/null
@@ -345,7 +353,7 @@ cp "$seed/manifest.json" "$seed/artemis-data.tgz" "$work/noseed/"
 status=0
 message="$("$here/run.sh" "$work/noseed" "$work/noseed-out" 10 artemis-thesis:43bafcee17c artemis-thesis:8325896e0b4 2>&1 >/dev/null)" || status=$?
 expect "run.sh refuses a seed without seed.dump" "$((status != 0))/$(grep -c 'seed file missing' <<<"$message")" 1/1
-images=(artemis-thesis:43bafcee17c artemis-thesis:9.9.3 artemis-thesis:8325896e0b4 artemis-thesis:f3463b75408
+images=(artemis-thesis:43bafcee17c artemis-thesis:9.9.3 artemis-thesis:8325896e0b4
     artemis-thesis:c136826e299 artemis-thesis:24a062759c2)
 campaign_inputs_of() {
     bash -c 'here="$1"; shift; source "$here/lib/inputs.sh"; source "$here/lib/stack.sh"; source "$here/lib/k6-limits.sh"
