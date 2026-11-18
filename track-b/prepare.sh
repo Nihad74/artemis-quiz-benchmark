@@ -7,13 +7,15 @@
 #                  default: all of them
 #
 # The measured commits get their D17 timer from patches/<commit>.patch, on a detached worktree of the commit; the
-# releases (migration steps only) are built without a change. The script runs in the repository that contains it,
-# which needs the remote `origin` (ls1intum/Artemis): it fetches develop (build-image.sh tags by the merge base with
-# origin/develop) and the release tags. The patch commits get a fixed committer and the author date, so the worktree
-# HEAD is the same on every host.
+# releases (migration steps only) are built without a change. The worktrees belong to the Artemis clone ARTEMIS_REPO
+# (default <worktree-root>/artemis), whose remote `origin` must be ls1intum/Artemis; if the folder does not exist, the
+# script clones it without file contents and without a checkout (`--filter=blob:none --no-checkout`), and each worktree
+# fetches the files it needs. It fetches develop (build-image.sh tags by the merge base with origin/develop) and the
+# release tags. The patch commits get a fixed committer and the author date, so the worktree HEAD is the same on every
+# host.
 #
 # It can run again: an existing worktree is reused if it holds the commit and its patch and has no uncommitted changes,
-# else the script stops. An existing image is kept if its label thesis.head names a commit of this repository with the
+# else the script stops. An existing image is kept if its label thesis.head names a commit of the Artemis clone with the
 # same base and the same patch; delete the image to build it again.
 set -euo pipefail
 
@@ -37,7 +39,7 @@ else
     commits+=("${releases[@]}")
 fi
 
-git() { command git -C "$here" "$@"; }
+git() { command git -C "$repo" "$@"; }
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
 # The patch of <commit>, or nothing for a release; stops for an unknown commit.
@@ -70,6 +72,15 @@ matches() {
 for commit in "${commits[@]}"; do
     patch_of "$commit" >/dev/null
 done
+repo="${ARTEMIS_REPO:-$root/artemis}"
+if [[ ! -e "$repo" ]]; then
+    log "cloning ls1intum/Artemis into $repo (without file contents)"
+    command git clone --quiet --filter=blob:none --no-checkout https://github.com/ls1intum/Artemis.git "$repo"
+fi
+if [[ ! "$(git remote get-url origin)" =~ ls1intum/Artemis(\.git)?$ ]]; then
+    echo "the remote origin of $repo is not ls1intum/Artemis: $(git remote get-url origin)" >&2
+    exit 1
+fi
 log "fetching develop and ${releases[*]} from origin"
 git fetch --quiet --no-tags origin develop
 for release in "${releases[@]}"; do
