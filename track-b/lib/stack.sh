@@ -23,6 +23,29 @@ compose() {
 
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
+# wait_for_evaluation <image> <quiz> <file>: 0 on a timer match, 1 on timeout, 2 if the logs cannot be read.
+wait_for_evaluation() {
+    local deadline=$((SECONDS + 300))
+    local -a evaluation_pipe
+    while ((SECONDS < deadline)); do
+        # Read the full stream: exiting at the first match could give Compose a broken pipe.
+        if compose "$1" logs artemis | awk -v timer="calculateAllResults quiz=$2 " '
+            !found && index($0, timer) { print; found = 1 }
+            END { if (!found) exit 3 }
+        ' >"$3"; then
+            return 0
+        else
+            evaluation_pipe=("${PIPESTATUS[@]}")
+            if ((evaluation_pipe[0] != 0 || evaluation_pipe[1] != 3)); then
+                log "could not read the evaluation log for quiz $2"
+                return 2
+            fi
+        fi
+        sleep 2
+    done
+    return 1
+}
+
 # restore_seed <image> <seed-folder>: fresh volumes with the database dump (seed.dump) and the file storage
 # (artemis-data.tgz) of the seed folder; PostgreSQL runs afterwards, Artemis does not.
 restore_seed() {

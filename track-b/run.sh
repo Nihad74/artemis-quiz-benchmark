@@ -120,6 +120,9 @@ else
         fi
     done
 fi
+for image in "${!image_id[@]}"; do
+    verify_image_commit "$image" "${image_id[$image]}" || exit 2
+done
 images_json="$(for image in "${!image_id[@]}"; do jq -n --arg k "$image" --arg v "${image_id[$image]}" '{($k): $v}'; done | jq -s add)"
 compose "${image_id[${side_a[-1]}]}" config --format json >"$out/compose.json"
 jq -n --arg seed "$seed" --argjson students "$students" --argjson repetitions "$repetitions" \
@@ -149,18 +152,6 @@ psql_at() {
 
 pg_stat() {
     psql_at "$1" "copy (select relname, n_tup_ins, n_tup_upd, n_tup_del from pg_stat_user_tables order by relname) to stdout with csv header"
-}
-
-# wait_for_evaluation <image> <quiz> <file>: the D17 timer line of the quiz with its log timestamp, at most 300 s.
-wait_for_evaluation() {
-    local deadline=$((SECONDS + 300))
-    while ((SECONDS < deadline)); do
-        if compose "$1" logs artemis 2>/dev/null | grep -m1 "calculateAllResults quiz=$2 " >"$3"; then
-            return 0
-        fi
-        sleep 2
-    done
-    return 1
 }
 
 # phase_folders <folder> <manifest> <sessions>: control/ and phase1/ to phase3/ with the inputs of the k6 scripts.
@@ -222,10 +213,12 @@ measure() {
     local repetition="$1" side="$2"
     shift 2
     local images=("$@") dir="$out/$repetition-$side"
-    local measured="${images[-1]}" image start evaluated=true semantics_exit=0
+    local measured="${images[-1]}" image start semantics_exit=0
     local measured_id="${image_id[${images[-1]}]}"
     local warmup_control_exit=0 warmup_phase1_exit=0 warmup_phase2_exit=0 warmup_phase3_exit=0 warmup_freshness_exit=0
     local control_exit=0 phase1_exit=0 phase2_exit=0 phase3_exit=0 freshness_exit=0
+    local warmup_evaluation_exit=0 evaluation_exit=0
+    local server_log_exit=0
     mkdir -p "$dir"
 
     log "run $repetition-$side: restore, start ${images[*]}"
@@ -261,7 +254,7 @@ measure() {
     fi
     "$here/k6.sh" "$project" phase1.js "$dir/warm-up/phase1" -e QUIZ=warmUp -e STUDENTS="$warmup_students" -e SEED="$schedule_seed" \
         >"$dir/warm-up/phase1/k6.log" 2>&1 || warmup_phase1_exit=$?
-    wait_for_evaluation "$measured_id" "$warmup_quiz" "$dir/warm-up/evaluation.txt" || evaluated=false
+    wait_for_evaluation "$measured_id" "$warmup_quiz" "$dir/warm-up/evaluation.txt" || warmup_evaluation_exit=$?
     cp "$dir/warm-up/phase1/questions.json" "$dir/warm-up/phase2/" 2>/dev/null || true
     "$here/k6.sh" "$project" phase2.js "$dir/warm-up/phase2" -e QUIZ=warmUp -e STUDENTS="$warmup_students" \
         -e ROUNDS="$warmup_rounds" -e SEED="$schedule_seed" >"$dir/warm-up/phase2/k6.log" 2>&1 || warmup_phase2_exit=$?
@@ -286,7 +279,7 @@ measure() {
     compose "$measured_id" exec -T postgres head -1 /proc/stat >"$dir/proc-stat-before.txt"
     "$here/k6.sh" "$project" phase1.js "$dir/phase1" -e QUIZ=benchmark -e SEED="$schedule_seed" \
         >"$dir/phase1/k6.log" 2>&1 || phase1_exit=$?
-    wait_for_evaluation "$measured_id" "$benchmark_quiz" "$dir/evaluation.txt" || evaluated=false
+    wait_for_evaluation "$measured_id" "$benchmark_quiz" "$dir/evaluation.txt" || evaluation_exit=$?
     log "run $repetition-$side: Phase 2, $rounds statistics rounds"
     cp "$dir/phase1/questions.json" "$dir/phase2/" 2>/dev/null || true
     "$here/k6.sh" "$project" phase2.js "$dir/phase2" -e QUIZ=benchmark -e STUDENTS="$students" -e ROUNDS="$rounds" \
@@ -310,7 +303,7 @@ measure() {
     log "run $repetition-$side: semantics"
     node "$here/semantics.mjs" --manifest "$manifest" --server "$server" --quiz benchmark --students "$students" \
         --out "$dir/semantics.json" || semantics_exit=$?
-    compose "$measured_id" logs artemis >"$dir/server.log" 2>&1
+    compose "$measured_id" logs artemis >"$dir/server.log" 2>&1 || server_log_exit=$?
     compose "$measured_id" down -v >/dev/null 2>&1
     find "$dir" -name sessions.json -delete
 
@@ -319,7 +312,9 @@ measure() {
         --argjson warmUpPhase1Exit "$warmup_phase1_exit" --argjson warmUpPhase2Exit "$warmup_phase2_exit" \
         --argjson warmUpPhase3Exit "$warmup_phase3_exit" --argjson warmUpFreshnessExit "$warmup_freshness_exit" \
         --argjson phase1Exit "$phase1_exit" --argjson phase2Exit "$phase2_exit" --argjson phase3Exit "$phase3_exit" \
-        --argjson freshnessExit "$freshness_exit" --argjson semanticsExit "$semantics_exit" --argjson evaluated "$evaluated" \
+        --argjson freshnessExit "$freshness_exit" --argjson semanticsExit "$semantics_exit" --argjson serverLogExit "$server_log_exit" \
+        --argjson warmUpEvaluationExit "$warmup_evaluation_exit" --argjson evaluationExit "$evaluation_exit" \
+        --argjson evaluated "$([[ "$warmup_evaluation_exit/$evaluation_exit" == 0/0 ]] && echo true || echo false)" \
         --argjson phase3Run "$([[ "$phase3" == 1 ]] && echo true || echo false)" \
         --argjson controlRun "$([[ "$control" == 1 ]] && echo true || echo false)" \
         '$ARGS.named' >"$dir/exits.json"
@@ -355,7 +350,7 @@ done
                 def round1: if . == null then "-" else (. * 10 | round / 10 | tostring) end;
                 def p95($summary; $type): $summary[0].metrics["http_req_duration{type:\($type)}"].values["p(95)"] // null | round1;
                 [$run, $r[0].measured, ($r[0].outcome // ($r[0].valid | tostring)), p95($c; "control-submit"), p95($p1; "start-participation"), p95($p1; "save"),
-                    p95($p1; "submit"), ($r[0].evaluationMillis // "-" | tostring), ($r[0].statisticsMode // "-"),
+                    (if $r[0].valid then p95($p1; "submit") else "-" end), ($r[0].evaluationMillis // "-" | tostring), ($r[0].statisticsMode // "-"),
                     p95($p2; "statistics-overview,read:repeated"), p95($p2; "statistics-points,read:repeated"), p95($p2; "statistics-question,read:repeated"),
                     p95($p3; "practice-submit"), ($r[0].freshnessP95Millis | round1)] | @tsv'
         done

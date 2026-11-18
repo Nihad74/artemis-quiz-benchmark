@@ -51,3 +51,19 @@ image_ids() {
     done
     jq -n "${args[@]}" '$ARGS.named'
 }
+
+# verify_image_commit <tag> <image-id>: check the base in artemis-thesis:<base>[-<suffix>] against the frozen image.
+verify_image_commit() {
+    local tag="$1" id="$2" base commit
+    [[ "$tag" == artemis-thesis:* ]] || return 0
+    base="${tag#artemis-thesis:}"
+    base="${base%%-*}"
+    if ! commit="$(docker image inspect "$id" --format '{{index .Config.Labels "thesis.commit"}}')"; then
+        printf 'cannot inspect image %s for %s\n' "$id" "$tag" >&2
+        return 1
+    fi
+    if [[ -z "$base" || "$commit" != "$base" ]]; then
+        printf '%s (%s): thesis.commit is %s, expected %s\n' "$tag" "$id" "${commit:-missing}" "$base" >&2
+        return 1
+    fi
+}

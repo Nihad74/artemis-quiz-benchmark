@@ -15,16 +15,17 @@ every run has at least 100 observations (D38 rule 4).
 
 A run has an outcome (judge.mjs, D44): valid, failed (the server failed the workload: evidence against the hypothesis,
 never a latency sample), or invalid (the measurement cannot be trusted). A run set is a result set only if complete.json
-exists, it has at least five valid runs per side, and no failed or invalid run (D6); fewer valid repetitions form a
-complete pilot. Hypothesis verdicts (D16, D44) are given only for a result set of the targeted pair of the hypothesis
-(D37) at 2000 students; every other run set shows the same values as an illustration, without a verdict. H3 reads the
-statistics directly after the evaluation: the initial reads of Phase 2 (5 observations of the overview and the points
-page per run). Standard library only.
+matches the requested repetition and valid-run counts, with exactly that many valid runs per side and no failed or invalid
+runs. At least five valid runs per side are required (D6); fewer form a complete pilot. Hypothesis verdicts (D16, D44)
+are given only for a result set of the targeted pair (D37) at 2000 students. Other run sets show the same values as
+an illustration, without a verdict. H3 reads statistics directly after the evaluation: the initial reads of Phase 2
+(5 observations of the overview and the points page per run). Standard library only.
 """
 
 import argparse
 import csv
 import json
+import math
 import os
 import random
 import re
@@ -43,6 +44,8 @@ MIN_RUNS = 5  # D6
 MIN_P99 = 100  # D38 rule 4
 BOOTSTRAP = 10_000
 VERDICT_STUDENTS = 2000  # D16
+H3_PRACTICE_RATE = 10  # D42
+PRACTICE_RATE_TOLERANCE = 0.05  # D43
 # D37: the targeted pair whose result set decides the hypothesis.
 HYPOTHESIS_PAIRS = {"H2": ("43bafcee17c", "f3463b75408"), "H3": ("c136826e299", "24a062759c2")}
 
@@ -57,11 +60,15 @@ def set_state(folder, parameters, runs):
     complete = load(folder / "complete.json")
     counts = {side: {outcome: sum(run.side == side and run.outcome == outcome for run in runs) for outcome in ("valid", "failed", "invalid")} for side in "AB"}
     text = "; ".join(f"side {side}: {c['valid']} valid, {c['failed']} failed, {c['invalid']} invalid" for side, c in counts.items())
-    repetitions = parameters.get("repetitions") or 0
-    sufficient = all(c["valid"] >= MIN_RUNS and c["invalid"] == 0 and c["failed"] == 0 for c in counts.values())
-    if complete and repetitions >= MIN_RUNS and sufficient and complete.get("repetitions", 0) >= MIN_RUNS:
+    repetitions = parameters.get("repetitions")
+    complete_matches = (complete and type(repetitions) is int and repetitions > 0
+                        and len(runs) == 2 * repetitions
+                        and all(type(complete.get(key)) is int and complete[key] == repetitions
+                                for key in ("repetitions", "validA", "validB"))
+                        and all(c == {"valid": repetitions, "invalid": 0, "failed": 0} for c in counts.values()))
+    if complete_matches and repetitions >= MIN_RUNS:
         return "result set", f"**Result set** (complete.json, {repetitions} repetitions): {text}."
-    if complete and 0 < repetitions < MIN_RUNS and all(c["valid"] >= repetitions for c in counts.values()):
+    if complete_matches:
         return "complete pilot", (f"**Complete pilot** ({repetitions} repetition{'s' if repetitions != 1 else ''}, fewer than {MIN_RUNS}, D6): "
                                   f"{text}. For orientation only; no result set and no verdict.")
     return "incomplete", f"**Incomplete attempt:** {text}. Server failures remain evidence, not latency samples or completed result sets; no statistical verdict."
@@ -100,6 +107,47 @@ def trend(summary, metric):
 
 def count(summary, metric, key="count"):
     return (summary or {}).get("metrics", {}).get(metric, {}).get("values", {}).get(key)
+
+
+def finite_number(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def time_to_result(summary):
+    values = trend(summary, "phase1_time_to_result")
+    return values if (values.get("count") or 0) > 0 and count(summary, "phase1_results_received") != 0 else {}
+
+
+def h3_practice_count(parameters):
+    """The expected POST count at the configured H3 rate, capped at one POST per student."""
+    seconds, students = parameters.get("practiceSeconds"), parameters.get("students")
+    if parameters.get("phase3") is not True or parameters.get("practiceRate") != H3_PRACTICE_RATE:
+        return None
+    if not finite_number(seconds) or seconds <= 0 or type(students) is not int or students < 1:
+        return None
+    return math.floor(min(seconds * H3_PRACTICE_RATE, students) + 0.5)
+
+
+def has_h3_freshness(run, expected):
+    """Check whether the run's freshness measurement supports the H3 workload."""
+    phase, fresh = run.phase3_info, run.freshness or {}
+    tutors = phase.get("tutors")
+    rate, span = fresh.get("achievedPostRate"), fresh.get("postSpanMillis")
+    if expected is None or expected < 2 or phase.get("rate") != H3_PRACTICE_RATE or phase.get("submissions") != expected:
+        return False
+    if fresh.get("complete") is not True or fresh.get("errors") != [] or fresh.get("captureErrors", []) != []:
+        return False
+    if any(fresh.get(key) != expected for key in ("expectedSubmissions", "practiceSent", "submissions")):
+        return False
+    if count(run.phase3, "phase3_practice_answered") != expected or type(tutors) is not int or tutors < 1:
+        return False
+    if fresh.get("tutors") != tutors or fresh.get("values") != expected * tutors:
+        return False
+    if not finite_number(rate) or not finite_number(span) or span <= 0 or not math.isclose(rate, (expected - 1) * 1000 / span):
+        return False
+    if abs(rate - H3_PRACTICE_RATE) > H3_PRACTICE_RATE * PRACTICE_RATE_TOLERANCE:
+        return False
+    return finite_number(fresh.get("p95Millis")) and type(fresh.get("p95Censored")) is bool
 
 
 class Run:
@@ -247,6 +295,8 @@ def duration_rows(runs, phase, types, prefix="http_req_duration{type:", suffix="
         if summary is None:
             continue
         for type_ in types:
+            if type_ == "submit" and not run.valid:
+                continue
             row = duration_row(run.name, type_, trend(summary, f"{prefix}{type_}{suffix}"))
             if row:
                 lines.append(row)
@@ -344,7 +394,8 @@ def run_set_section(folder, label, rng):
         out += duration_rows(runs, 0, CONTROL_TYPES)
         out.append("")
 
-    out += ["### Phase 1: request duration (ms)", "", "p99 only with at least 100 observations (D38 rule 4).", "",
+    out += ["### Phase 1: request duration (ms)", "",
+            "Submit durations are shown only for valid runs. p99 only with at least 100 observations (D38 rule 4).", "",
             "| Run | Request | n | Median | p95 | p99 | Max |", "|---|---|---|---|---|---|---|"]
     out += duration_rows(runs, 1, PHASE1_TYPES)
     out.append("")
@@ -352,11 +403,11 @@ def run_set_section(folder, label, rng):
     out += ["### Evaluation and time to result (D17)", "",
             "Evaluation: the duration of `calculateAllResults` (timer log line). Time to result: from the stored due date of the "
             "quiz (the scheduled evaluation start) until a student's result message reaches k6 over the websocket; recorded "
-            "since 2026-11-18.", "",
+            "since 2026-11-18. No latency statistics are shown when no results were received.", "",
             "| Run | Evaluation | Results received | Time to result median | p95 | p99 | Max |", "|---|---|---|---|---|---|---|"]
     for run in runs:
         millis = run.info.get("evaluationMillis")
-        result = trend(run.phase1, "phase1_time_to_result")
+        result = time_to_result(run.phase1)
         received = count(run.phase1, "phase1_results_received")
         n = result.get("count") or 0
         out.append(f"| {run.name} | {'not logged' if millis is None else f'{millis / 1000:.2f} s'} | "
@@ -394,25 +445,29 @@ def run_set_section(folder, label, rng):
         out += duration_rows(runs, 3, PHASE3_TYPES)
         out += ["", "### Phase 3: statistics freshness (ms)", "",
                 "An aggregate metric (D42): for the n-th answered practice submission, the time until a tutor's open point "
-                "statistic shows at least n new unrated participants; one value per tutor and submission (freshness.mjs). Values "
-                "are signed: a count can appear before the n-th response reaches k6. A value a page never showed is censored at "
-                "the deadline (a lower bound); `≥` marks a p95 among censored values. Drain: from the last response to the "
-                "complete page, the slowest tutor. POST rate: the achieved rate of practice POSTs.", "",
-                "| Run | Statistics | Submissions | Values (censored) | Min | Median | p95 | p99 | Max | Drain | Websocket messages | POST rate | Measurement |",
+                "statistic shows at least n new unrated participants by the deadline; one value per tutor and submission "
+                "(freshness.mjs). Values are signed: a count can appear before the n-th response reaches k6. A value a page "
+                "never showed is censored at the deadline (a lower bound); `≥` marks a p95 among censored values. Drain: from "
+                "the last response to the complete page, the slowest tutor. Websocket messages count only those received by "
+                "the deadline. POST rate: the achieved rate of practice POSTs.", "",
+                "| Run | Statistics | Practice POSTs (sent / answered / planned) | Values (censored) | Min | Median | p95 | p99 | Max | Drain | Websocket messages | POST rate | Measurement |",
                 "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for run in runs:
             fresh = run.freshness
             if fresh is None:
                 continue
-            drains = [value for value in fresh["drainMillis"].values() if value is not None]
-            drain = "–" if len(drains) < fresh["tutors"] or not drains else f"{max(drains):.0f}"
+            drains = [value for value in fresh.get("drainMillis", {}).values() if value is not None]
+            tutors = fresh.get("tutors")
+            drain = "–" if not tutors or len(drains) < tutors else f"{max(drains):.0f}"
             censored = fresh.get("censored", fresh.get("missing", 0))
-            p95 = f"{'≥' if fresh.get('p95Censored') else ''}{ms(fresh['p95Millis'])}"
+            p95 = f"{'≥' if fresh.get('p95Censored') else ''}{ms(fresh.get('p95Millis'))}"
             rate = fresh.get("achievedPostRate")
             measurement = "complete" if fresh.get("complete", True) else f"**incomplete:** {'; '.join(fresh['errors'])}"
-            out.append(f"| {run.name} | {run.phase3_info.get('mode') or '–'} | {fresh['submissions']} | {fresh['values']} ({censored}) | "
-                       f"{ms(fresh.get('minMillis'))} | {ms(fresh['medianMillis'])} | {p95} | {ms(fresh['p99Millis'])} | {ms(fresh['maxMillis'])} | {drain} | "
-                       f"{count(run.phase3, 'phase3_messages') or 0:.0f} | {'–' if rate is None else f'{rate:.2f}/s'} | {measurement} |")
+            posts = " / ".join(str(fresh[key]) if fresh.get(key) is not None else "–" for key in ("practiceSent", "submissions", "expectedSubmissions"))
+            messages = fresh.get("messagesPerTutor")
+            out.append(f"| {run.name} | {run.phase3_info.get('mode') or '–'} | {posts} | {fresh.get('values', '–')} ({censored}) | "
+                       f"{ms(fresh.get('minMillis'))} | {ms(fresh.get('medianMillis'))} | {p95} | {ms(fresh.get('p99Millis'))} | {ms(fresh.get('maxMillis'))} | {drain} | "
+                       f"{'–' if messages is None else sum(messages.values())} | {'–' if rate is None else f'{rate:.2f}/s'} | {measurement} |")
         out.append("")
 
     out += ["### Server, database, and k6", "",
@@ -452,8 +507,8 @@ def run_set_section(folder, label, rng):
     for type_ in PHASE1_TYPES:
         metrics += stats_metrics(f"Phase 1 {type_}", lambda run, t=type_: trend(run.phase1, f"http_req_duration{{type:{t}}}"))
     metrics.append(("Evaluation (s)", lambda run: None if run.info.get("evaluationMillis") is None else run.info["evaluationMillis"] / 1000))
-    if any(trend(run.phase1, "phase1_time_to_result") for run in runs):
-        metrics += stats_metrics("Time to result", lambda run: trend(run.phase1, "phase1_time_to_result"))
+    if any(time_to_result(run.phase1) for run in runs):
+        metrics += stats_metrics("Time to result", lambda run: time_to_result(run.phase1))
     if has_phase2:
         has_initial = any(phase2_metric(run.phase2, "statistics-points", "initial") for run in runs)
         for type_ in PHASE2_TYPES:
@@ -484,7 +539,9 @@ def run_set_section(folder, label, rng):
             "(D16; each tutor's first round, 5 observations of the overview and the points page and 50 of the question pages "
             "per run, so a per-run p95 of the overview is close to its maximum); upper limit of the 95% bootstrap interval of "
             "the per-run p95 on side B. The repeated reads are in the table above and are not part of H3. H3 freshness: "
-            "the same for the per-run freshness p95; a p95 among censored values counts as above the bound.", "",
+            f"the same for the per-run freshness p95; a p95 among censored values counts as above the bound. Freshness "
+            f"requires the configured rate of {H3_PRACTICE_RATE}/s, complete counts, and an achieved POST rate within "
+            f"{PRACTICE_RATE_TOLERANCE:.0%} of that rate in every run on both sides.", "",
             "| Check | Value (side B unless stated) | Observations per run | Bound | Result |", "|---|---|---|---|---|"]
     students = parameters.get("students")
     a_commit, b_commit = commit_of(parameters.get("sideA")), commit_of(parameters.get("sideB"))
@@ -528,14 +585,23 @@ def run_set_section(folder, label, rng):
             cell = "no initial reads recorded" if not values else (f"{values[0]:.1f} (one run)" if high is None else f"{high:.1f}")
             out.append(f"| H3 {type_} initial p95 (ms) | {cell} | {', '.join(f'{c:.0f}' for c in counts) or '–'} | < 1000 | "
                        f"{result('H3', None if high is None else high < 1000, len(values))} |")
-    if has_phase3:
-        values = [(run.freshness or {}).get("p95Millis") for run in valid["B"]]
-        censored = any((run.freshness or {}).get("p95Censored") for run in valid["B"])
-        high = bootstrap_high([v for v in values if v is not None], rng)
+    if has_phase3 or parameters.get("phase3"):
+        expected = h3_practice_count(parameters)
+        candidate = [run.freshness for run in valid["B"] if run.freshness and finite_number(run.freshness.get("p95Millis"))]
+        values = [fresh["p95Millis"] for fresh in candidate]
+        censored = any(fresh.get("p95Censored") for fresh in candidate)
+        high = bootstrap_high(values, rng)
         cell = ("–" if high is None else f"{high:.1f}") + (" (censored)" if censored else "")
-        counts = sorted({(run.freshness or {}).get("values") for run in valid["B"]} - {None})
-        out.append(f"| H3 freshness p95 (ms) | {cell} | {', '.join(str(c) for c in counts) or '–'} | < 2000 | "
-                   f"{result('H3', None if high is None else (not censored and high < 2000), sum(v is not None for v in values))} |")
+        counts = sorted({fresh.get("values") for fresh in candidate} - {None})
+        verdict = no_verdict("H3")
+        if verdict is None:
+            if parameters.get("practiceRate") != H3_PRACTICE_RATE:
+                verdict = f"untested: configured practice rate is not {H3_PRACTICE_RATE}/s"
+            elif not all(has_h3_freshness(run, expected) for side in "AB" for run in valid[side]):
+                verdict = f"untested: incomplete {H3_PRACTICE_RATE}/s practice evidence"
+            else:
+                verdict = result("H3", None if high is None else (not censored and high < 2000), len(values))
+        out.append(f"| H3 freshness p95 (ms) | {cell} | {', '.join(str(c) for c in counts) or '–'} | < 2000 | {verdict} |")
     else:
         out.append("| H3 freshness p95 (ms) | Phase 3 not run | – | < 2000 | untested (D38 rule 6) |")
     out.append("")

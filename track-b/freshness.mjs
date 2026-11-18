@@ -8,16 +8,17 @@
  * tutor). One value per tutor and submission. It does not follow one result: a count can become visible before the n-th
  * response reaches k6, so values are signed. All times come from the k6 process, so one clock.
  *
- * A value that a page never showed before the deadline of phase3.js is censored: it is counted at the deadline, a lower
+ * A value that a page never showed by the deadline of phase3.js is censored: it is counted at the deadline, a lower
  * bound, so it raises the percentiles instead of being dropped (D42: a complete run above the H3 bound is evidence
  * against H3). `p95Censored` says that the p95 lies among censored values and is only a lower bound.
  *
  * The measurement itself must be complete; otherwise the script exits with status 1 and lists the errors:
- *   - every practice submission answered;
- *   - every expected tutor (phase3.json) subscribed before the first practice POST was sent and received at least one
- *     statistics message (the server acknowledges no SUBSCRIBE; a lost subscription shows up as a page without messages);
- *   - the practice POSTs were sent at the planned rate (within 5 %; the arrival executor paces iteration starts, the POST
- *     follows 10 s later).
+ *   - every practice submission answered, even if the response arrived after the page deadline;
+ *   - every expected tutor (phase3.json) opened its page and subscribed before the first practice POST, and received
+ *     at least one statistics message by the deadline when all POSTs succeeded;
+ *   - every expected practice POST was sent, and multiple POSTs span enough time to measure the achieved rate
+ *     (within 5 % of the planned rate).
+ * `captureErrors` lists errors independent of a shortfall in server responses.
  *
  * Usage: node freshness.mjs <phase3-folder>
  * Writes <phase3-folder>/freshness.json and prints one summary line. p99 only with at least 100 values (D38 rule 4).
@@ -33,29 +34,82 @@ if (!folder) {
 const MIN_P99 = 100;
 const RATE_TOLERANCE = 0.05;
 
-const phase = JSON.parse(readFileSync(`${folder}/phase3.json`, 'utf8'));
+const captureErrors = [];
+const responseErrors = [];
+let phase = {};
+try {
+    phase = JSON.parse(readFileSync(`${folder}/phase3.json`, 'utf8')) ?? {};
+} catch (error) {
+    captureErrors.push(`cannot read phase3.json: ${error.message}`);
+}
+const validCount = (value) => Number.isSafeInteger(value) && value > 0;
+const expectedSubmissions = validCount(phase.submissions) ? phase.submissions : null;
+const tutors = validCount(phase.tutors) ? phase.tutors : null;
+const deadline = validCount(phase.deadline) ? phase.deadline : null;
+const plannedRate = Number.isFinite(phase.rate) && phase.rate > 0 ? phase.rate : null;
+for (const [field, value] of Object.entries({ submissions: expectedSubmissions, tutors, deadline, rate: plannedRate })) {
+    if (value === null) {
+        captureErrors.push(`phase3.json: invalid ${field}`);
+    }
+}
 const answered = [];
 const sent = [];
 const seen = new Map();
 const subscribed = new Map();
 const messages = new Map();
 const METRICS = new Set(['phase3_practice_answered', 'phase3_practice_sent', 'phase3_seen', 'phase3_subscribed', 'phase3_messages']);
-for (const line of gunzipSync(readFileSync(`${folder}/raw.json.gz`)).toString('utf8').split('\n')) {
+let raw = '';
+try {
+    raw = gunzipSync(readFileSync(`${folder}/raw.json.gz`)).toString('utf8');
+} catch (error) {
+    captureErrors.push(`cannot read raw.json.gz: ${error.message}`);
+}
+for (const line of raw.split('\n')) {
     if (!line.includes('"phase3_')) {
         continue;
     }
-    const { type, metric, data } = JSON.parse(line);
+    let point;
+    try {
+        point = JSON.parse(line);
+    } catch (error) {
+        captureErrors.push(`invalid Phase 3 metric record: ${error.message}`);
+        continue;
+    }
+    const { type, metric, data } = point ?? {};
     if (type !== 'Point' || !METRICS.has(metric)) {
         continue;
     }
-    const time = Date.parse(data.time);
+    const time = typeof data?.time === 'string' ? Date.parse(data.time) : NaN;
+    if (!Number.isFinite(time)) {
+        captureErrors.push(`${metric}: invalid timestamp`);
+        continue;
+    }
+    // k6 writes sub-millisecond timestamps, which Date.parse truncates.
+    const afterDeadline = deadline !== null &&
+        (time > deadline || (time === deadline && /\.\d{3}\d*[1-9]\d*(?:Z|[+-]\d{2}:\d{2})$/.test(data.time)));
+    if ((metric === 'phase3_seen' || metric === 'phase3_messages' || metric === 'phase3_subscribed') &&
+        (deadline === null || afterDeadline)) {
+        continue;
+    }
+    if (metric === 'phase3_seen' ? !Number.isFinite(data.value) : data.value !== 1) {
+        captureErrors.push(`${metric}: invalid value`);
+        continue;
+    }
     const tutor = data.tags?.tutor;
+    if (metric !== 'phase3_practice_answered' && metric !== 'phase3_practice_sent' &&
+        (typeof tutor !== 'string' || !/^(0|[1-9]\d*)$/.test(tutor) || Number(tutor) >= tutors)) {
+        captureErrors.push(`${metric}: unexpected tutor ${tutor}`);
+        continue;
+    }
     if (metric === 'phase3_practice_answered') {
         answered.push(time);
     } else if (metric === 'phase3_practice_sent') {
+        if (afterDeadline) {
+            captureErrors.push(`${metric}: POST sent after the deadline`);
+        }
         sent.push(time);
     } else if (metric === 'phase3_subscribed') {
-        subscribed.set(tutor, time);
+        subscribed.set(tutor, Math.min(time, subscribed.get(tutor) ?? Infinity));
     } else if (metric === 'phase3_messages') {
         messages.set(tutor, (messages.get(tutor) ?? 0) + 1);
     } else {
@@ -68,29 +122,34 @@ for (const line of gunzipSync(readFileSync(`${folder}/raw.json.gz`)).toString('u
 answered.sort((a, b) => a - b);
 sent.sort((a, b) => a - b);
 
-const errors = [];
-if (answered.length !== phase.submissions) {
-    errors.push(`${answered.length} of ${phase.submissions} practice submissions answered`);
+const answerShortfall = expectedSubmissions !== null && answered.length < expectedSubmissions;
+if (expectedSubmissions !== null && answered.length !== expectedSubmissions) {
+    (answerShortfall ? responseErrors : captureErrors).push(`${answered.length} of ${expectedSubmissions} practice submissions answered`);
+}
+if (expectedSubmissions !== null && sent.length !== expectedSubmissions) {
+    captureErrors.push(`${sent.length} of ${expectedSubmissions} practice POSTs sent`);
 }
 const firstSent = sent[0] ?? Infinity;
-for (let index = 0; index < phase.tutors; index++) {
+for (let index = 0; index < tutors; index++) {
     const tutor = String(index);
-    if (!seen.has(tutor)) {
-        errors.push(`tutor ${tutor}: no page observation`);
+    if (!seen.get(tutor)?.some(({ time, shown }) => shown === 0 && time < firstSent)) {
+        captureErrors.push(`tutor ${tutor}: no initial page observation before the first practice POST`);
     }
     if (!subscribed.has(tutor)) {
-        errors.push(`tutor ${tutor}: never subscribed`);
+        captureErrors.push(`tutor ${tutor}: never subscribed`);
     } else if (subscribed.get(tutor) >= firstSent) {
-        errors.push(`tutor ${tutor}: subscribed ${subscribed.get(tutor) - firstSent} ms after the first practice POST`);
+        captureErrors.push(`tutor ${tutor}: subscribed ${subscribed.get(tutor) - firstSent} ms after the first practice POST`);
     }
-    if (!messages.get(tutor)) {
-        errors.push(`tutor ${tutor}: no statistics message`);
+    if (answered.length > 0 && !messages.get(tutor)) {
+        (answerShortfall ? responseErrors : captureErrors).push(`tutor ${tutor}: no statistics message by the deadline`);
     }
 }
 const postSpanMillis = sent.length > 1 ? sent.at(-1) - sent[0] : null;
-const achievedRate = postSpanMillis ? ((sent.length - 1) * 1000) / postSpanMillis : null;
-if (achievedRate !== null && Math.abs(achievedRate / phase.rate - 1) > RATE_TOLERANCE) {
-    errors.push(`practice POSTs sent at ${achievedRate.toFixed(2)}/s, planned ${phase.rate}/s`);
+const achievedRate = postSpanMillis > 0 ? ((sent.length - 1) * 1000) / postSpanMillis : null;
+if (expectedSubmissions > 1 && !Number.isFinite(achievedRate)) {
+    captureErrors.push('practice POSTs have no positive send span');
+} else if (plannedRate !== null && achievedRate !== null && Math.abs(achievedRate - plannedRate) > RATE_TOLERANCE * plannedRate) {
+    captureErrors.push(`practice POSTs sent at ${achievedRate.toFixed(2)}/s, planned ${plannedRate}/s`);
 }
 
 /** k6's percentile: linear interpolation between the closest ranks. */
@@ -103,7 +162,7 @@ function percentile(sorted, p) {
 const values = [];
 let censored = 0;
 const drain = {};
-for (let index = 0; index < phase.tutors; index++) {
+for (let index = 0; deadline !== null && index < tutors; index++) {
     const observations = (seen.get(String(index)) ?? []).sort((a, b) => a.time - b.time);
     let next = 0;
     for (let n = 1; n <= answered.length; n++) {
@@ -113,7 +172,7 @@ for (let index = 0; index < phase.tutors; index++) {
         if (next < observations.length) {
             values.push({ millis: observations[next].time - answered[n - 1], censored: false });
         } else {
-            values.push({ millis: phase.deadline - answered[n - 1], censored: true });
+            values.push({ millis: deadline - answered[n - 1], censored: true });
             censored++;
         }
     }
@@ -124,10 +183,11 @@ values.sort((a, b) => a.millis - b.millis);
 const millis = values.map((value) => value.millis);
 // The p95 is a lower bound if a censored value is at or below its interpolation rank.
 const rank = Math.ceil((values.length - 1) * 0.95);
+const errors = [...captureErrors, ...responseErrors];
 const summary = {
     submissions: answered.length,
-    expectedSubmissions: phase.submissions,
-    tutors: phase.tutors,
+    expectedSubmissions,
+    tutors,
     values: values.length,
     censored,
     medianMillis: values.length ? percentile(millis, 0.5) : null,
@@ -137,10 +197,11 @@ const summary = {
     minMillis: millis[0] ?? null,
     maxMillis: millis.at(-1) ?? null,
     drainMillis: drain,
-    messagesPerTutor: Object.fromEntries([...Array(phase.tutors).keys()].map((index) => [index, messages.get(String(index)) ?? 0])),
+    messagesPerTutor: Object.fromEntries(Array.from({ length: tutors }, (_, index) => [index, messages.get(String(index)) ?? 0])),
     practiceSent: sent.length,
     achievedPostRate: achievedRate,
     postSpanMillis,
+    captureErrors,
     errors,
     complete: errors.length === 0,
 };

@@ -36,13 +36,18 @@ make_run() {
     local out="$1" name="$2" semantics="$3" exit_status="${4:-0}"
     mkdir -p "$out/$name"
     cp "$semantics" "$out/$name/semantics.json"
-    echo '[{"image":"artemis-thesis:x","id":"sha256:abc","head":"83f5370b5d7"}]' >"$out/$name/images.json"
+    echo '[{"image":"artemis-thesis:x","id":"sha256:abc","commit":"x","head":"83f5370b5d7"}]' >"$out/$name/images.json"
     echo '{"version":"9.9","commit":"83f5370b5d7cee936e6e961d4a5420743144c2b8"}' >"$out/$name/info.json"
     echo "$containers" >"$out/$name/containers.json"
     echo '2026-11-17T15:50:00.000Z INFO Thesis benchmark: calculateAllResults quiz=4 participations=2000 durationMillis=1000' >"$out/$name/evaluation.txt"
     jq -n --arg side "${name#*-}" --argjson phase1Exit "$exit_status" '{repetition: 1, side: $side, measured: "artemis-thesis:x",
-        runningImageId: "sha256:abc", warmUpPhase1Exit: 0, phase1Exit: $phase1Exit, phase2Exit: 0, semanticsExit: 0,
+        runningImageId: "sha256:abc", warmUpPhase1Exit: 0, warmUpPhase2Exit: 0, phase1Exit: $phase1Exit, phase2Exit: 0, semanticsExit: 0,
         evaluated: true, phase3Run: false, controlRun: false}' >"$out/$name/exits.json"
+    local phase
+    for phase in warm-up/phase1 warm-up/phase2 phase1 phase2; do
+        mkdir -p "$out/$name/$phase"
+        echo '{"metrics":{}}' >"$out/$name/$phase/summary.json"
+    done
 }
 
 new_set() {
@@ -84,6 +89,18 @@ make_run "$out" 1-A "$bad" 0
 judge "$out" 1-A
 expect "wrong scores with passing k6 are a server failure" "$(field "$out" 1-A '[.expectedResults, .outcome] | join(" ")')" "false failed"
 expect "wrong scores set no reference" "$(exists "$out/reference.json")" no
+out="$work/missing-answers"
+new_set "$out"
+jq '.students.tbstudent1.answers = []' "$good" >"$work/answers.json"
+make_run "$out" 1-A "$work/answers.json"
+judge "$out" 1-A
+expect "missing stored answers disqualify a run despite correct scores" \
+    "$(field "$out" 1-A '[.outcome, .expectedResults] | join(" ")')" "failed false"
+jq '.students.tbstudent1.answers[0].selection = []' "$good" >"$work/answers.json"
+make_run "$out" 1-B "$work/answers.json"
+judge "$out" 1-B
+expect "a wrong stored selection disqualifies a run despite correct scores" \
+    "$(field "$out" 1-B '[.outcome, .expectedResults] | join(" ")')" "failed false"
 
 # 3. A later run must equal the reference.
 out="$work/compare"
@@ -108,6 +125,13 @@ jq '.images["artemis-thesis:x"] = "sha256:def"' "$out/parameters.json" >"$work/p
 make_run "$out" 1-A "$good"
 judge "$out" 1-A
 expect "a run of another image than the frozen id is invalid, even if the tag now points to it" "$(field "$out" 1-A .outcome)" invalid
+out="$work/wrong-base"
+new_set "$out"
+make_run "$out" 1-A "$good"
+jq '.[0].commit = "wrong"' "$out/1-A/images.json" >"$work/image.json" && mv "$work/image.json" "$out/1-A/images.json"
+judge "$out" 1-A
+expect "matching IDs with the wrong Artemis base label are invalid" \
+    "$(field "$out" 1-A '[.outcome, any(.measurementReasons[]; contains("measured base commit"))] | join(" ")')" "invalid true"
 out="$work/settings"
 new_set "$out"
 make_run "$out" 1-A "$good"
@@ -127,6 +151,36 @@ expect "dropped iterations make the run invalid" "$(field "$out" 1-A .outcome)" 
 make_run "$out" 1-B "$good" 1
 judge "$out" 1-B
 expect "a k6 error (exit 1) makes the run invalid" "$(field "$out" 1-B .outcome)" invalid
+out="$work/log-reading"
+new_set "$out"
+make_run "$out" 1-A "$good"
+jq '.evaluated = false | .warmUpEvaluationExit = 0 | .evaluationExit = 2' "$out/1-A/exits.json" >"$work/exits.json"
+mv "$work/exits.json" "$out/1-A/exits.json"
+judge "$out" 1-A
+expect "a log read error is invalid, not server failure evidence" \
+    "$(field "$out" 1-A '[.outcome, (.serverReasons | length)] | join(" ")')" "invalid 0"
+make_run "$out" 1-B "$good"
+rm "$out/1-B/phase2/summary.json"
+judge "$out" 1-B
+expect "a successful phase exit cannot replace its missing summary" "$(field "$out" 1-B .outcome)" invalid
+
+(
+    source "$here/lib/stack.sh"
+    compose() { awk 'BEGIN { print "calculateAllResults quiz=5 durationMillis=1"; for (i=0;i<20000;i++) print "more logs" }'; }
+    status=0
+    wait_for_evaluation "sha256:abc" 5 "$work/evaluation.txt" || status=$?
+    if grep -qFx 'calculateAllResults quiz=5 durationMillis=1' "$work/evaluation.txt"; then
+        printf '/match' >"$work/evaluation-content"
+    fi
+    printf '%s\n' "$status" >"$work/evaluation-status"
+    compose() { return 9; }
+    status=0
+    wait_for_evaluation "sha256:abc" 5 "$work/evaluation.txt" >/dev/null || status=$?
+    printf '%s\n' "$status" >"$work/evaluation-read-error"
+)
+expect "evaluation log reader saves the timer match and handles a full pipe" \
+    "$(cat "$work/evaluation-status")$(cat "$work/evaluation-content" 2>/dev/null || true)" 0/match
+expect "evaluation log reader distinguishes a Compose error" "$(cat "$work/evaluation-read-error")" 2
 
 # 6. Only valid runs count towards completion. Server failures stay separate as failure.json.
 out="$work/complete"
@@ -155,8 +209,13 @@ out="$work/h3"
 new_set "$out" "$seed"
 for name in 1-A 1-B; do
     make_run "$out" "$name" "$phase3_pilot/semantics.json"
-    jq '.phase3Run = true | .phase3Exit = 0 | .freshnessExit = 0' "$out/$name/exits.json" >"$work/exits.json" && mv "$work/exits.json" "$out/$name/exits.json"
-    mkdir -p "$out/$name/phase3"
+    jq '.phase3Run = true | .phase3Exit = 0 | .freshnessExit = 0 | .warmUpPhase3Exit = 0 | .warmUpFreshnessExit = 0' "$out/$name/exits.json" >"$work/exits.json"
+    mv "$work/exits.json" "$out/$name/exits.json"
+    mkdir -p "$out/$name/phase3" "$out/$name/warm-up/phase3"
+    for phase in phase3 warm-up/phase3; do
+        echo '{"metrics":{}}' >"$out/$name/$phase/summary.json"
+    done
+    echo '{"complete":true}' >"$out/$name/warm-up/phase3/freshness.json"
     cp "$phase3_pilot/phase3/phase3.json" "$out/$name/phase3/"
 done
 echo '{"complete":true,"errors":[],"p95Millis":3500,"p95Censored":true}' >"$out/1-A/phase3/freshness.json"
@@ -165,6 +224,18 @@ judge "$out" 1-A
 judge "$out" 1-B
 expect "a complete run above the H3 bound stays valid" "$(field "$out" 1-A .outcome)" valid
 expect "an incomplete freshness measurement is invalid" "$(field "$out" 1-B .outcome)" invalid
+jq '.phase3Exit = 99 | .freshnessExit = 1' "$out/1-B/exits.json" >"$work/exits.json" && mv "$work/exits.json" "$out/1-B/exits.json"
+with_threshold "$out/1-B" phase3 phase3_practice_answered
+echo '{"complete":false,"submissions":599,"expectedSubmissions":600,"captureErrors":[],"errors":["599 of 600 practice submissions answered"]}' >"$out/1-B/phase3/freshness.json"
+judge "$out" 1-B
+status=0
+node "$here/judge.mjs" complete "$out" 1 >/dev/null || status=$?
+expect "rejected practice POSTs preserve server failure evidence despite the missing freshness" \
+    "$status/$(field "$out" 1-B .outcome)/$(exists "$out/failure.json")/$(exists "$out/complete.json")" 1/failed/yes/no
+jq '.captureErrors = ["tutor never subscribed"]' "$out/1-B/phase3/freshness.json" >"$work/fresh.json"
+mv "$work/fresh.json" "$out/1-B/phase3/freshness.json"
+judge "$out" 1-B
+expect "an independent capture error remains invalid despite rejected POSTs" "$(field "$out" 1-B .outcome)" invalid
 
 # 8. Replay the saved f3463b75408 workload failure. Its latencies cannot complete a result set. The historical pilot lacks
 #    container facts, so the fixture supplies matching synthetic facts. Only outcome classification is replayed;
@@ -175,7 +246,7 @@ jq --argjson settings "$settings" '.settings = $settings | .repetitions = 5 | .i
     "$final/json-answers/s2000/parameters.json" >"$replay/parameters.json"
 for name in 1-A 1-B; do
     mkdir -p "$replay/$name"
-    (cd "$final/json-answers/s2000/$name" && cp -R exits.json images.json info.json semantics.json phase1 phase2 warm-up "$replay/$name/" &&
+    (cd "$final/json-answers/s2000/$name" && cp -R exits.json images.json info.json semantics.json phase1 phase2 control warm-up "$replay/$name/" &&
         { [[ ! -e evaluation.txt ]] || cp evaluation.txt "$replay/$name/"; })
     jq '.runningImageId = "sha256:abc"' "$replay/$name/exits.json" >"$work/exits.json" && mv "$work/exits.json" "$replay/$name/exits.json"
     jq --arg image "$(jq -r .measured "$replay/$name/exits.json")" 'map(if .image == $image then .id = "sha256:abc" else . end)' \
@@ -187,6 +258,7 @@ expect "the baseline run of the pair is valid" "$(field "$replay" 1-A .outcome)"
 expect "the f3463b75408 collapse is a server failure, not an invalid measurement" "$(field "$replay" 1-B .outcome)" failed
 expect "its reasons name the failed submissions and the missing evaluation" \
     "$(field "$replay" 1-B '[(.reasons | map(select(test("phase1_submitted_in_time") or test("evaluation not logged"))) | length)] | .[0]')" 2
+expect "no websocket samples means no result latency" "$(field "$replay" 1-B .timeToResultP95Millis)" null
 for repetition in 2 3 4 5; do
     for side in A B; do ln -s "$replay/1-$side" "$replay/$repetition-$side"; done
 done
@@ -225,6 +297,20 @@ expect "the H3 pair gives verdicts from a 2000-student result set" \
 expect "H3 reads the initial reads, 5 overview observations per run" \
     "$(grep -c '^| H3 statistics-overview initial p95 (ms) | [0-9.]* | 5 | < 1000 | holds |' "$work/s2000.md")" 1
 expect "the H3 pair gives no H2 verdict" "$(grep -c '^| H2 .*no verdict (not the H2 pair)' "$work/s2000.md")" 1
+jq '.practiceRate = 5' "$work/s2000/parameters.json" >"$work/report-parameters.json"
+mv "$work/report-parameters.json" "$work/s2000/parameters.json"
+python3 "$here/report.py" --out "$work/wrong-rate.md" "$work/s2000" >/dev/null
+expect "H3 freshness gives no verdict for a five-POSTs-per-second run set" \
+    "$(grep -c '^| H3 freshness .*| holds |$' "$work/wrong-rate.md" || true)" 0
+jq '.practiceRate = 10' "$work/s2000/parameters.json" >"$work/report-parameters.json"
+mv "$work/report-parameters.json" "$work/s2000/parameters.json"
+fresh="$work/s2000/1-B/phase3/freshness.json"
+cp "$fresh" "$work/complete-freshness.json"
+jq '.achievedPostRate = null' "$work/complete-freshness.json" >"$fresh"
+python3 "$here/report.py" --out "$work/unknown-rate.md" "$work/s2000" >/dev/null
+expect "H3 freshness gives no verdict with missing rate evidence in a valid run" \
+    "$(grep -c '^| H3 freshness .*| holds |$' "$work/unknown-rate.md" || true)" 0
+cp "$work/complete-freshness.json" "$fresh"
 for repetition in 1 2 3 4 5; do
     summary="$work/s2000/$repetition-B/phase2/summary.json"
     jq '.metrics["http_req_duration{type:statistics-overview,read:initial}"].values["p(95)"] = 1500
@@ -271,6 +357,38 @@ status=0
 message="$(CAMPAIGN="$work/inputs-other.json" "$here/run.sh" "$seed" "$work/campaign-out" 10 artemis-thesis:43bafcee17c artemis-thesis:8325896e0b4 2>&1 >/dev/null)" || status=$?
 expect "run.sh refuses settings that differ from the campaign" "$status/$(grep -c 'differ from the campaign.*settings' <<<"$message")" 2/1
 
+# Docker is read-only in preflight and retry tests, even if those checks regress.
+mkdir -p "$work/bin"
+cat >"$work/bin/docker" <<'SH'
+#!/usr/bin/env bash
+case "$1 $2" in
+    'ps --format') exit 0 ;;
+    'image inspect')
+        if [[ "$3" == "${RETAGGED_IMAGE:-}" ]]; then
+            shift 3
+            exec "$REAL_DOCKER" image inspect artemis-thesis:8325896e0b4 "$@"
+        fi
+        ;;
+    'compose --env-file') [[ " $* " == *' config '* ]] || exit 93 ;;
+    'info --format') ;;
+    *) exit 93 ;;
+esac
+exec "$REAL_DOCKER" "$@"
+SH
+chmod +x "$work/bin/docker"
+docker_bin="$(command -v docker)"
+jq '.images["artemis-thesis:43bafcee17c"] = .images["artemis-thesis:8325896e0b4"]' "$work/inputs.json" >"$work/inputs-wrong-base.json"
+status=0
+message="$(PATH="$work/bin:$PATH" REAL_DOCKER="$docker_bin" CAMPAIGN="$work/inputs-wrong-base.json" \
+    "$here/run.sh" "$seed" "$work/wrong-base-out" 10 artemis-thesis:43bafcee17c artemis-thesis:8325896e0b4 2>&1 >/dev/null)" || status=$?
+expect "run.sh rejects a frozen image from the wrong base before starting it" \
+    "$status/$(grep -c 'thesis.commit is 8325896e0b4, expected 43bafcee17c' <<<"$message" || true)" 2/1
+status=0
+message="$(PATH="$work/bin:$PATH" REAL_DOCKER="$docker_bin" RETAGGED_IMAGE=artemis-thesis:9.9.3 \
+    "$here/migration-check.sh" "$work/wrong-migration" 10 artemis-thesis:43bafcee17c artemis-thesis:9.9.3 artemis-thesis:8325896e0b4 2>&1 >/dev/null)" || status=$?
+expect "migration-check.sh rejects a migration image from the wrong base" \
+    "$status/$(grep -c 'thesis.commit is 8325896e0b4, expected 9.9.3' <<<"$message" || true)" 2/1
+
 # 12. night.sh: pilot settings refused; a copied pilot is not a finished scale; only a finished campaign set is skipped.
 status=0
 ROUNDS=1 NIGHT_CHECK=1 RESULTS="$work/night" "$here/night.sh" e2e 100 >/dev/null 2>&1 || status=$?
@@ -315,6 +433,18 @@ if committed; then
     status=0
     NIGHT_CHECK=1 SEED_FOLDER="$seed" RESULTS="$work/night" "$here/night.sh" e2e 1000 2000 >/dev/null 2>&1 || status=$?
     expect "night.sh exits 1 if a requested scale is not finished" "$status" 1
+    rm "$work/night/e2e/s2000/complete.json"
+    echo '{"failedB":1}' >"$work/night/e2e/s2000/failure.json"
+    status=0
+    message="$(PATH="$work/bin:$PATH" REAL_DOCKER="$docker_bin" NIGHT_AWAKE=1 SEED_FOLDER="$seed" RESULTS="$work/night" \
+        "$here/night.sh" e2e 2000 2>&1)" || status=$?
+    expect "matching campaign failures suppress automatic retry" "$status/$(grep -c 'no automatic retry' <<<"$message")" 1/1
+    jq '.settings.run.rounds = 1' "$work/unchanged.json" >"$work/night/e2e/s2000/parameters.json"
+    status=0
+    message="$(PATH="$work/bin:$PATH" REAL_DOCKER="$docker_bin" NIGHT_AWAKE=1 SEED_FOLDER="$seed" RESULTS="$work/night" \
+        "$here/night.sh" e2e 2000 2>&1)" || status=$?
+    expect "a foreign failure is archived rather than blocking a campaign" \
+        "$status/$(grep -c 'earlier attempt moved' <<<"$message")/$(grep -c 'no automatic retry' <<<"$message" || true)" 1/1/0
     jq '.images["artemis-thesis:9.9.3"] = "sha256:other"' "$work/inputs.json" >"$work/night/inputs.json"
     status=0
     message="$(NIGHT_CHECK=1 SEED_FOLDER="$seed" RESULTS="$work/night" "$here/night.sh" e2e 2000 2>&1)" || status=$?
@@ -351,6 +481,21 @@ freshness_fixture "$work/fresh-censored" 2 2
 node "$here/freshness.mjs" "$work/fresh-censored" >/dev/null
 expect "an unseen value is censored, the run stays complete" "$(jq -c '[.censored, .complete, .values]' "$work/fresh-censored/freshness.json")" '[1,true,6]'
 expect "the censored value enters the maximum" "$(jq .maxMillis "$work/fresh-censored/freshness.json")" 59680
+mkdir "$work/fresh-no-sends" "$work/fresh-after-deadline"
+for fixture in fresh-no-sends fresh-after-deadline; do
+    cp "$work/fresh-censored/phase3.json" "$work/$fixture/"
+done
+gzip -dc "$work/fresh-censored/raw.json.gz" | jq -c 'select(.metric != "phase3_practice_sent")' | gzip >"$work/fresh-no-sends/raw.json.gz"
+status=0
+node "$here/freshness.mjs" "$work/fresh-no-sends" >/dev/null 2>&1 || status=$?
+expect "missing POST timestamps invalidate freshness despite complete responses" \
+    "$status/$(jq -r .complete "$work/fresh-no-sends/freshness.json")" 1/false
+{
+    gzip -dc "$work/fresh-censored/raw.json.gz"
+    node -p 'JSON.stringify({type:"Point", metric:"phase3_seen", data:{time:new Date(1800000060010).toISOString(), value:3, tags:{tutor:"0"}}})'
+} | gzip >"$work/fresh-after-deadline/raw.json.gz"
+node "$here/freshness.mjs" "$work/fresh-after-deadline" >/dev/null
+expect "statistics first visible after the deadline remain censored" "$(jq .censored "$work/fresh-after-deadline/freshness.json")" 1
 
 if ((failures > 0)); then
     echo "$failures checks failed"

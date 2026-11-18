@@ -9,14 +9,43 @@
  * question scores its full points or 0.
  */
 
+import { isDeepStrictEqual } from 'node:util';
+import { createRequest } from './quiz.mjs';
+
 const SUBMIT_OFFSET = 4;
 const PRACTICE_OFFSET = 5;
 
-function points(questions, variant) {
-    return Object.fromEntries(questions.map((question) => {
+// Use the seed fixture, not the observed quiz or the code that sends the answers. The fixture lists the options in
+// text order, the drag items in text order, the drops in x-coordinate order, and the spots in spot-number order.
+const { quizQuestions: questions } = createRequest({}).exercise;
+const MAX_POINTS = questions.reduce((sum, question) => sum + question.points, 0);
+const VALUES = [0, 1, 2].map((variant) => {
+    let total = 0;
+    const answers = new Map(questions.map((question) => {
         const n = Number(question.title.slice(1));
-        return [question.title, (variant + n - 1) % 3 !== 0 ? question.points : 0];
+        const correct = (variant + n - 1) % 3 !== 0;
+        const scoreInPoints = correct ? question.points : 0;
+        total += scoreInPoints;
+        return [question.title, { scoreInPoints, selection: selection(question, correct) }];
     }));
+    return { answers, total };
+});
+
+// Content keys and list order match the normalized selections in semantics.mjs.
+function selection(question, correct) {
+    switch (question.type) {
+        case 'multiple-choice':
+            return question.answerOptions.filter((option) => option.isCorrect === correct).map((option) => option.text);
+        case 'drag-and-drop':
+            return question.dragItems.map((item, slot) => {
+                const location = question.dropLocations[(slot + (correct ? 0 : 1)) % question.dropLocations.length];
+                return { item: item.text, drop: `${location.posX},${location.posY}` };
+            });
+        case 'short-answer':
+            return question.spots.map(({ spotNr }, slot) => ({ spot: spotNr, text: correct ? question.solutions[slot].text : 'wrong' }));
+        default:
+            throw new Error(`unknown fixture question type: ${question.type}`);
+    }
 }
 
 /**
@@ -26,8 +55,9 @@ function points(questions, variant) {
  */
 export function expectedResultErrors(semantics, logins, students, practices) {
     const errors = [];
-    const questions = semantics.quiz.questions;
-    const maxPoints = semantics.quiz.maxPoints;
+    if (semantics.quiz.maxPoints !== MAX_POINTS) {
+        errors.push(`quiz: ${semantics.quiz.maxPoints} maximum points, expected ${MAX_POINTS}`);
+    }
     if (Object.keys(semantics.students).length !== students) {
         errors.push(`${Object.keys(semantics.students).length} students in the semantics, expected ${students}`);
     }
@@ -40,22 +70,42 @@ export function expectedResultErrors(semantics, logins, students, practices) {
     for (let index = 0; index < students; index++) {
         const login = logins[index];
         const student = semantics.students[login];
-        const expected = points(questions, index + SUBMIT_OFFSET);
-        const total = Object.values(expected).reduce((sum, value) => sum + value, 0);
+        const { answers: expected, total } = VALUES[(index + SUBMIT_OFFSET) % VALUES.length];
         count(total, 'rated');
         if (index < practices) {
-            count(Object.values(points(questions, index + PRACTICE_OFFSET)).reduce((sum, value) => sum + value, 0), 'unrated');
+            count(VALUES[(index + PRACTICE_OFFSET) % VALUES.length].total, 'unrated');
         }
         if (!student) {
             errors.push(`${login}: missing`);
             continue;
         }
-        if (student.submissionScoreInPoints !== total || Math.abs(student.score - (100 * total) / maxPoints) > 1e-9) {
+        if (student.submissionScoreInPoints !== total || Math.abs(student.score - (100 * total) / MAX_POINTS) > 1e-9) {
             errors.push(`${login}: ${student.submissionScoreInPoints} points (${student.score} %), expected ${total} points`);
         }
-        for (const answer of student.answers) {
-            if (answer.scoreInPoints !== expected[answer.question]) {
-                errors.push(`${login} ${answer.question}: ${answer.scoreInPoints} points, expected ${expected[answer.question]}`);
+        const seen = new Set();
+        const answers = Array.isArray(student.answers) ? student.answers : [];
+        for (const answer of answers) {
+            const question = answer?.question;
+            const wanted = expected.get(question);
+            if (!wanted) {
+                errors.push(`${login}: unexpected answer for ${question}`);
+                continue;
+            }
+            if (seen.has(question)) {
+                errors.push(`${login} ${question}: duplicate answer`);
+                continue;
+            }
+            seen.add(question);
+            if (answer.scoreInPoints !== wanted.scoreInPoints) {
+                errors.push(`${login} ${question}: ${answer.scoreInPoints} points, expected ${wanted.scoreInPoints}`);
+            }
+            if (!isDeepStrictEqual(answer.selection, wanted.selection)) {
+                errors.push(`${login} ${question}: selection ${JSON.stringify(answer.selection)}, expected ${JSON.stringify(wanted.selection)}`);
+            }
+        }
+        for (const question of expected.keys()) {
+            if (!seen.has(question)) {
+                errors.push(`${login} ${question}: missing answer`);
             }
         }
     }

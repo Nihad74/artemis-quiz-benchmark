@@ -6,10 +6,11 @@
  *     Writes <run-folder>/run.json from exits.json (k6 exit statuses and flags, written by run.sh) and the artifacts of the
  *     run, with an outcome:
  *       invalid  the measurement cannot be trusted: the running container is not the image id frozen in parameters.json,
- *                its settings differ from the frozen compose configuration, the server reports another commit, a k6 run
+ *                its settings differ from the frozen compose configuration, the server reports another commit, the
+ *                evaluation logs could not be read, a k6 run
  *                ended with an error (exit status other than 0 and 99) or without a summary, a load-generator threshold
  *                failed (dropped iterations, practice POSTs behind schedule), a threshold this file does not know failed,
- *                the freshness measurement is incomplete, or the semantics could not be recorded;
+ *                the freshness capture failed independently of rejected practice POSTs, or the semantics could not be recorded;
  *       failed   the measurement is trustworthy, but the server failed the workload: a server-outcome threshold failed
  *                (failed requests or checks, submissions not answered in time, results not received, pages not loaded,
  *                practice submissions not answered), the evaluation was not logged, or the results differ from the
@@ -62,7 +63,6 @@ const SERVER_THRESHOLDS = new Set([
     'phase1_submitted_in_time',
     'phase1_failed_students',
     'phase1_results_received',
-    'phase1_result_subscribed_late',
     'phase2_pages_loaded',
     'phase3_practice_answered',
 ]);
@@ -119,40 +119,75 @@ function judgeRun(out, dir) {
     const measurement = [];
     const server = [];
 
-    for (const [name, status] of Object.entries(exits).filter(([key]) => key.endsWith('Exit'))) {
-        if (status === 0) {
+    const summaries = {};
+    const unansweredPractice = new Set();
+    for (const [name, folder] of Object.entries(K6_RUNS)) {
+        if (folder.endsWith('control') && !exits.controlRun || folder.endsWith('phase3') && !exits.phase3Run) {
             continue;
         }
-        const folder = K6_RUNS[name];
-        if (!folder) {
-            // freshness.mjs and semantics.mjs: the measurement itself failed.
-            measurement.push(`${name} ${status}`);
+        const status = exits[name];
+        if (status === undefined) {
+            measurement.push(`no exit status for ${folder}`);
             continue;
         }
         const summary = read(`${dir}/${folder}/summary.json`);
-        if (status !== 99 || !summary) {
+        summaries[folder] = summary;
+        if (!summary || (status !== 0 && status !== 99)) {
             measurement.push(`${name} ${status}${summary ? '' : ' without summary'}`);
             continue;
         }
         const failed = failedThresholds(summary);
+        if (status === 0) {
+            if (failed.length) {
+                measurement.push(`${name} reports success despite failed thresholds: ${failed.join(', ')}`);
+            }
+            continue;
+        }
         const serverFailed = failed.filter((metric) => SERVER_THRESHOLDS.has(metric.split('{')[0]));
         const otherFailed = failed.filter((metric) => !serverFailed.includes(metric));
         if (serverFailed.length) {
             server.push(`${name}: ${serverFailed.join(', ')}`);
         }
+        if (serverFailed.includes('phase3_practice_answered') && !otherFailed.length) {
+            unansweredPractice.add(folder);
+        }
         if (otherFailed.length || !failed.length) {
             measurement.push(`${name}: ${otherFailed.length ? otherFailed.join(', ') : 'no failed threshold recorded'}`);
         }
     }
-    if (!exits.evaluated) {
+    for (const name of ['semanticsExit', 'serverLogExit']) {
+        if (exits[name]) {
+            measurement.push(`${name} ${exits[name]}`);
+        }
+    }
+    const evaluations = [exits.warmUpEvaluationExit, exits.evaluationExit];
+    // Older run records only have the combined evaluation flag.
+    if ((evaluations.every((status) => status === undefined) && !exits.evaluated) || evaluations.includes(1)) {
         server.push('evaluation not logged');
+    }
+    if (evaluations.some((status) => status !== undefined && status !== 0 && status !== 1)) {
+        measurement.push('could not read the evaluation log');
     }
 
     const freshness = read(`${dir}/phase3/freshness.json`);
-    if (exits.phase3Run && !freshness) {
-        measurement.push('no freshness measurement');
-    } else if (exits.phase3Run && !freshness.complete) {
-        measurement.push(`freshness measurement incomplete: ${freshness.errors.join('; ')}`);
+    if (exits.phase3Run) {
+        for (const [folder, result, status] of [
+            ['phase3', freshness, exits.freshnessExit],
+            ['warm-up/phase3', read(`${dir}/warm-up/phase3/freshness.json`), exits.warmUpFreshnessExit],
+        ]) {
+            if (!result) {
+                measurement.push(`${folder}: no freshness measurement`);
+            } else if (!result.complete) {
+                // Rejected POSTs make freshness unmeasurable without invalidating a captured server failure.
+                const rejected = unansweredPractice.has(folder) && status === 1 && result.captureErrors?.length === 0
+                    && result.submissions < result.expectedSubmissions;
+                if (!rejected) {
+                    measurement.push(`${folder}: freshness measurement incomplete: ${result.errors.join('; ')}`);
+                }
+            } else if (status !== 0) {
+                measurement.push(`${folder}: freshness exit ${status}`);
+            }
+        }
     }
 
     // Provenance against the inputs frozen at the start of the run set (D44), not against a later look at a tag.
@@ -164,6 +199,10 @@ function judgeRun(out, dir) {
         measurement.push(`no frozen image id for ${exits.measured} in parameters.json`);
     } else if (exits.runningImageId !== plannedId || measuredImage?.id !== plannedId) {
         measurement.push(`running image ${exits.runningImageId} is not the frozen id ${plannedId} of ${exits.measured}`);
+    }
+    const expectedCommit = exits.measured.match(/^artemis-thesis:([^-]+)(?:-|$)/)?.[1];
+    if (expectedCommit && measuredImage?.commit !== expectedCommit) {
+        measurement.push(`measured base commit ${measuredImage?.commit}, planned ${expectedCommit}`);
     }
     if (!measuredImage?.head || !info?.commit?.startsWith(measuredImage.head)) {
         measurement.push(`server commit ${info?.commit} is not the image label ${measuredImage?.head}`);
@@ -206,9 +245,9 @@ function judgeRun(out, dir) {
     const evaluationMillis = Number(evaluation.match(/durationMillis=(\d+)/)?.[1] ?? NaN);
     const evaluationEnd = Date.parse(evaluation.match(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/)?.[0] ?? '');
     const phase2 = read(`${dir}/phase2/phase2.json`);
-    const phase2Summary = read(`${dir}/phase2/summary.json`);
-    const firstRequest = phase2Summary?.metrics?.phase2_first_request?.values?.min;
-    const phase1 = read(`${dir}/phase1/summary.json`)?.metrics?.phase1_time_to_result?.values;
+    const firstRequest = summaries.phase2?.metrics?.phase2_first_request?.values?.min;
+    const resultTrend = summaries.phase1?.metrics?.phase1_time_to_result?.values;
+    const phase1 = resultTrend?.count > 0 ? resultTrend : null;
     const run = {
         ...exits,
         plannedImageId: plannedId ?? null,
@@ -251,7 +290,8 @@ function judgeComplete(out, repetitions) {
         invalid: runs.filter((entry) => (entry.run?.outcome ?? 'invalid') === 'invalid').map((entry) => entry.name),
     };
     const complete = Number.isInteger(repetitions) && repetitions > 0 &&
-        state.invalid.length === 0 && state.validA >= repetitions && state.validB >= repetitions;
+        state.invalid.length === 0 && state.failedA === 0 && state.failedB === 0 &&
+        state.validA === repetitions && state.validB === repetitions;
     console.log(JSON.stringify({ complete, ...state }));
     if (!complete) {
         rmSync(`${out}/complete.json`, { force: true });

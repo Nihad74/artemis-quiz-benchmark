@@ -35,12 +35,14 @@ export ARTEMIS_PORT="${ARTEMIS_PORT:-18080}"
 export JAVA_HEAP="${JAVA_HEAP:--Xms2g -Xmx2g}"
 
 source "$here/lib/stack.sh"
+source "$here/lib/inputs.sh"
 
 first="${images[0]}"
 # Every image starts by the id it has now, so a tag that moves during the check changes nothing (D44).
 declare -A image_id=()
 for image in "${images[@]}"; do
     image_id[$image]="$(docker image inspect "$image" --format '{{.Id}}')"
+    verify_image_commit "$image" "${image_id[$image]}" || exit 2
 done
 seed_commit="${SEED_COMMIT:-43bafcee17c}"
 label="$(docker image inspect "${image_id[$first]}" --format '{{index .Config.Labels "thesis.commit"}}')"

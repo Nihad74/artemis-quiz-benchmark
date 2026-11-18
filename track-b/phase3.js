@@ -173,6 +173,10 @@ export function pages(run) {
     if (!check(null, { 'statistics page answers 200': () => opened.status === 200, 'statistics footer answers 200': () => footer.status === 200 })) {
         return;
     }
+    const deadlineAt = run.start + DEADLINE_MS;
+    if (Date.now() > deadlineAt) {
+        return;
+    }
     const initial = unrated(opened.json());
     seen.add(0, tags);
 
@@ -193,8 +197,11 @@ export function pages(run) {
         }
         ws.close();
     };
-    const deadline = setTimeout(() => finish(false), run.start + DEADLINE_MS - Date.now());
+    const deadline = setTimeout(() => finish(false), deadlineAt - Date.now());
     const observe = (count) => {
+        if (done || Date.now() > deadlineAt) {
+            return;
+        }
         const shown = count - initial;
         seen.add(shown, tags);
         if (shown >= SUBMISSIONS) {
@@ -223,6 +230,9 @@ export function pages(run) {
     };
     ws.onmessage = (event) => {
         for (const { command, body } of frames(event.data)) {
+            if (done || Date.now() > deadlineAt) {
+                return;
+            }
             if (command === 'CONNECTED') {
                 ws.send(frame('SUBSCRIBE', { id: 'statistic', destination: `/topic/statistic/${config.quizId}` }));
                 subscribed.add(1, tags);
@@ -273,12 +283,11 @@ export function practice() {
     } else {
         behindSchedule.add(1);
     }
+    const body = JSON.stringify(practiceSubmission(questions, index + PRACTICE_VARIANT));
+    const submitUrl = `${SERVER}/api/quiz/exercises/${config.quizId}/submissions/practice`;
+    const submitParams = params(student, { type: 'practice-submit' });
     practiceSent.add(1);
-    const submitted = http.post(
-        `${SERVER}/api/quiz/exercises/${config.quizId}/submissions/practice`,
-        JSON.stringify(practiceSubmission(questions, index + PRACTICE_VARIANT)),
-        params(student, { type: 'practice-submit' }),
-    );
+    const submitted = http.post(submitUrl, body, submitParams);
     if (check(submitted, { 'practice submission succeeds': (response) => response.status === 200 })) {
         answered.add(1);
     }

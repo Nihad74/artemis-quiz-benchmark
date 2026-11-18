@@ -43,13 +43,20 @@ REPETITIONS=5 ./run.sh "$results/seed-2000" "$results/e2e-s2000" 2000 \
 python3 report.py --out "$results/results.md" "$results/e2e-s2000"
 ```
 
-Campaign runs start every server by its frozen image ID. Compose ignores ambient `.env` files and `COMPOSE_*` variables.
-`night.sh` skips only matching campaign sets with five valid runs per side. Incomplete requested scales return nonzero.
-Server failures stay separate as evidence (`failure.json`), never latency samples or completed sets; they are not retried
-automatically. `NIGHT_CHECK=1 ./night.sh <comparison>` checks completion without starting a measurement.
+Campaign runs verify the base commit label and start each server by its frozen image ID. Compose ignores ambient
+`.env` files and `COMPOSE_*` variables. `night.sh` skips only matching campaign sets with five valid runs per side.
+Incomplete requested scales return nonzero. Server failures stay separate as evidence (`failure.json`), never as
+successful latency samples or completed sets. A failure suppresses retries only in the campaign that recorded it.
+`NIGHT_CHECK=1 ./night.sh <comparison>` checks completion without starting a measurement.
 
 H2 and H3 statistical verdicts require their specified pair, 2000 students, and five valid runs per side. H3 uses the
 initial statistics reads after evaluation, with only five overview and five points observations per run.
+The freshness verdict also requires captured practice POSTs at the specified 10/s rate (5% tolerance).
+The freshness clock stops at the drain deadline. A valid capture of rejected POSTs remains server-failure evidence
+even when it cannot produce a freshness result.
+
+The judge checks every stored answer against the seeded selection. An unreadable evaluation log is a measurement
+error, not evidence of failed evaluation. The report omits student result latency when no result arrived.
 
 The usage line at the top of each script lists its parameters and environment variables.
 

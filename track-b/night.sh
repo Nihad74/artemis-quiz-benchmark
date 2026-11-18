@@ -88,6 +88,9 @@ if [[ -n "$missing" ]]; then
     echo "$missing" >&2
     exit 1
 fi
+for image in "${all_images[@]}"; do
+    verify_image_commit "$image" "$(jq -r --arg image "$image" '.images[$image]' <<<"$inputs")" || exit 2
+done
 mkdir -p "$results"
 if [[ -e "$results/inputs.json" ]]; then
     if ! diff <(jq -S . "$results/inputs.json") <(jq -S . <<<"$inputs") >&2; then
@@ -115,20 +118,23 @@ matching_inputs() {
 
 finished() {
     [[ -f "$1/complete.json" ]] && matching_inputs "$1" "$2" || return 1
-    jq -e '.repetitions == 5 and .validA >= 5 and .validB >= 5 and (.invalid | length) == 0' "$1/complete.json" >/dev/null || return 1
+    jq -e '.repetitions == 5 and .validA == 5 and .validB == 5 and (.invalid | length) == 0
+        and (.failedA // 0) == 0 and (.failedB // 0) == 0' "$1/complete.json" >/dev/null || return 1
     # Recount the actual run records; the marker alone is not evidence of five valid runs.
     local records=("$1"/[0-9]*-[AB]/run.json)
     [[ -f "${records[0]}" ]] || return 1
     jq -es --slurpfile p "$1/parameters.json" '
         def valid($side):
             [.[] | select(.side == $side and .valid == true and (.outcome // "valid") == "valid")
-             | select(.runningImageId == $p[0].images[.measured] and .plannedImageId == .runningImageId)
-             | .repetition] | unique | length;
-        valid("A") >= 5 and valid("B") >= 5
+             | select(.measured == $p[0]["side" + $side][-1] and .runningImageId != null
+                      and .runningImageId == $p[0].images[.measured] and .plannedImageId == .runningImageId)
+             | .repetition] | sort == [1, 2, 3, 4, 5];
+        length == 10 and valid("A") and valid("B")
     ' "${records[@]}" >/dev/null 2>&1
 }
 
 has_failure_evidence() {
+    matching_inputs "$1" "$2" || return 1
     [[ ! -f "$1/failure.json" ]] || return 0
     local record
     for record in "$1"/[0-9]*-[AB]/run.json; do
@@ -165,7 +171,7 @@ for students in "${scales[@]}"; do
         log "$comparison s$students: finished in this campaign, skipped"
         continue
     fi
-    if has_failure_evidence "$out"; then
+    if has_failure_evidence "$out" "$students"; then
         log "$comparison s$students: server-failure evidence retained; NOT complete; no automatic retry"
         incomplete+=("s$students")
         continue
