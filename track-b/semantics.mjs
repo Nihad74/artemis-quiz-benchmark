@@ -8,7 +8,8 @@
  * - the statistics: the stored statistics of the quiz (relational baseline) or the statistics endpoints (on-demand
  *   statistics, from 24a062759c2 on), whichever the server offers;
  * - the rated participants in the point statistic as each tutor sees it: the tutors read the statistics in Phase 2;
- * - the text exercise of the control workflow and the warm-up and benchmark quizzes, which must still be unstarted.
+ * - the text exercises of the control workflow and its warm-up (D20) with their submitted texts, and the warm-up and
+ *   benchmark quizzes, which must still be unstarted.
  *
  * Components are keyed by content (option text, drop location position, drag item text, spot number), never by id.
  * Read-only for an evaluated quiz: --quiz evaluated (default, the seeded quiz) or, after a load test has run and the
@@ -151,7 +152,24 @@ async function unstartedQuiz(id) {
     const { data } = await teacher.get(`/api/quiz/quiz-exercises/${id}`);
     return { title: data.title, quizMode: data.quizMode, duration: data.duration, questions: data.quizQuestions.length, releaseDate: instant(data.releaseDate), dueDate: instant(data.dueDate) };
 }
-const textExercise = (await teacher.get(`/api/text/text-exercises/${manifest.textExercise}`)).data;
+
+/** A text exercise and its submitted texts, as the instructor sees them; `id` undefined for a seed without it. */
+async function textExercise(id) {
+    if (id === undefined) {
+        return null;
+    }
+    const { data } = await teacher.get(`/api/text/text-exercises/${id}`);
+    const submissions = (await teacher.get(`/api/text/exercises/${id}/text-submissions?submittedOnly=true`)).data;
+    return {
+        title: data.title,
+        maxPoints: data.maxPoints,
+        mode: data.mode,
+        includedInOverallScore: data.includedInOverallScore,
+        releaseDate: instant(data.releaseDate),
+        dueDate: instant(data.dueDate),
+        submittedTexts: submissions.map((submission) => submission.text).sort(),
+    };
+}
 
 const statistic = await statistics();
 const result = {
@@ -160,14 +178,8 @@ const result = {
     statisticsSource: statistic.source,
     statistics: { points: statistic.points, questions: statistic.questions },
     tutors: Object.fromEntries(Object.entries(tutors).sort(([a], [b]) => a.localeCompare(b))),
-    textExercise: {
-        title: textExercise.title,
-        maxPoints: textExercise.maxPoints,
-        mode: textExercise.mode,
-        includedInOverallScore: textExercise.includedInOverallScore,
-        releaseDate: instant(textExercise.releaseDate),
-        dueDate: instant(textExercise.dueDate),
-    },
+    textExercise: await textExercise(manifest.textExercise),
+    warmUpTextExercise: await textExercise(manifest.warmUpTextExercise),
     warmUpQuiz: await unstartedQuiz(manifest.warmUpQuiz),
     benchmarkQuiz: await unstartedQuiz(manifest.benchmarkQuiz),
 };

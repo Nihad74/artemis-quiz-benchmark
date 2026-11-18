@@ -4,7 +4,7 @@
  *
  * - one course with one instructor, `--tutors` tutors, and `--students` students. The instructor starts the quizzes; the
  *   tutors open the statistics pages in Phase 2 (D10; tutors may read the statistics on every compared commit);
- * - a text exercise, open for submissions for a year: the control workflow (D20);
+ * - two text exercises, open for submissions for a year: the control workflow (D20) and its warm-up (D38 rule 5);
  * - the evaluated quiz: every student loads it, starts the participation, saves once, and submits; the scheduled task
  *   evaluates it (D17). It carries answers, results, and statistics through the forward migration (D2, D19);
  * - the warm-up quiz (D38 rule 5) and the benchmark quiz: the same 10 questions, not started (D13), `--benchmark-duration`
@@ -89,18 +89,21 @@ await forEachLimited(logins, PARALLEL, (login) => createUser(login, 'students'))
 console.log(`course ${course.id}: 1 instructor, ${tutors.length} tutors, ${students} students`);
 
 const teacher = await new Client(args.server).login(instructor, args.password);
-const textExercise = (
-    await teacher.post('/api/text/text-exercises', {
-        title: 'Control text exercise',
+async function createTextExercise(title) {
+    const created = await teacher.post('/api/text/text-exercises', {
+        title,
         courseId: course.id,
         maxPoints: 10,
         includedInOverallScore: 'INCLUDED_COMPLETELY',
         mode: 'INDIVIDUAL',
         releaseDate: new Date(now - 864e5).toISOString(),
         dueDate: new Date(now + 365 * 864e5).toISOString(),
-    })
-).data.id;
-console.log(`text exercise ${textExercise}: open until ${new Date(now + 365 * 864e5).toISOString()}`);
+    });
+    return created.data.id;
+}
+const textExercise = await createTextExercise('Control text exercise');
+const warmUpTextExercise = await createTextExercise('Warm-up text exercise');
+console.log(`text exercises ${textExercise} (control) and ${warmUpTextExercise} (warm-up): open until ${new Date(now + 365 * 864e5).toISOString()}`);
 
 async function createQuiz(title, releaseDate, duration) {
     const { exercise, files } = createRequest({ title, releaseDate, duration: Number(duration) });
@@ -150,6 +153,7 @@ const manifest = {
     students: logins,
     password: args.password,
     textExercise,
+    warmUpTextExercise,
     evaluatedQuiz,
     warmUpQuiz,
     benchmarkQuiz,

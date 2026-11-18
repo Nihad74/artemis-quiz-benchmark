@@ -24,6 +24,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+CONTROL_TYPES = ["control-start", "control-load", "control-submit"]
 PHASE1_TYPES = ["start-participation", "save", "submit"]
 PHASE2_TYPES = ["statistics-overview", "statistics-points", "statistics-question", "statistics-footer"]
 PHASE3_TYPES = ["practice-load", "practice-submit", "statistics-open", "statistics-reload"]
@@ -74,6 +75,8 @@ class Run:
         self.name = folder.name
         self.side = folder.name.split("-")[1]
         self.info = load(folder / "run.json") or {}
+        self.control = load(folder / "control" / "summary.json")
+        self.control_info = load(folder / "control" / "control.json") or {}
         self.phase1 = load(folder / "phase1" / "summary.json")
         self.phase2 = load(folder / "phase2" / "summary.json")
         self.phase3 = load(folder / "phase3" / "summary.json")
@@ -81,12 +84,19 @@ class Run:
         self.freshness = load(folder / "phase3" / "freshness.json")
         self.parameters = parameters
 
-    def window(self, phase3):
-        """The sample times (s) of Phases 1 and 2 (phase3 False) or of Phase 3, split at the start of Phase 3."""
-        start = self.phase3_info.get("start")
-        if not start:
-            return (float("-inf"), float("inf")) if not phase3 else None
-        return (start / 1000, float("inf")) if phase3 else (float("-inf"), start / 1000)
+    def windows(self):
+        """The sample windows (s) with their snapshot files: the control workflow and Phase 3 if they ran, Phases 1 and 2."""
+        control_start, control_end = self.control_info.get("start"), self.control_info.get("end")
+        phase3_start = self.phase3_info.get("start")
+        low = control_end / 1000 if control_start and control_end else float("-inf")
+        high = phase3_start / 1000 if phase3_start else float("inf")
+        result = []
+        if control_start and control_end:
+            result.append(("control", (control_start / 1000, low), ("pg-stat-before-control.csv", "pg-stat-before.csv"), ("proc-stat-before-control.txt", "proc-stat-before.txt")))
+        result.append(("1–2", (low, high), ("pg-stat-before.csv", "pg-stat-after.csv"), ("proc-stat-before.txt", "proc-stat-after.txt")))
+        if phase3_start:
+            result.append(("3", (high, float("inf")), ("pg-stat-after.csv", "pg-stat-after-phase3.csv"), ("proc-stat-after.txt", "proc-stat-after-phase3.txt")))
+        return result
 
     @property
     def valid(self):
@@ -157,7 +167,7 @@ def median_with_interval(values, rng):
 def duration_rows(runs, phase, types, prefix="http_req_duration{type:", suffix="}"):
     lines = []
     for run in runs:
-        summary = {1: run.phase1, 2: run.phase2, 3: run.phase3}[phase]
+        summary = {0: run.control, 1: run.phase1, 2: run.phase2, 3: run.phase3}[phase]
         if summary is None:
             continue
         for type_ in types:
@@ -195,17 +205,25 @@ def run_set_section(folder, label, rng):
         out.append(f"- **Pilot:** fewer than {MIN_RUNS} runs per side (D6). The numbers are for orientation only; they are no result set.")
     out.append("")
 
-    out += ["### Runs", "", "| Run | Measured | Valid | Reasons | Statistics | Phase 2 delay | Submissions in time | Failed requests (Phase 1 / 2 / 3) |", "|---|---|---|---|---|---|---|---|"]
+    out += ["### Runs", "", "| Run | Measured | Valid | Reasons | Statistics | Phase 2 delay | Submissions in time | Failed requests (control / Phase 1 / 2 / 3) |", "|---|---|---|---|---|---|---|---|"]
     for run in runs:
         delay = run.info.get("phase2DelayMillis")
         submitted = count(run.phase1, "phase1_submitted_in_time")
         in_time = "–" if submitted is None else f"{submitted:.0f} of {parameters.get('students')}"
-        failed = [count(summary, "http_req_failed", "passes") for summary in (run.phase1, run.phase2, run.phase3)]
+        failed = [count(summary, "http_req_failed", "passes") for summary in (run.control, run.phase1, run.phase2, run.phase3)]
         out.append(f"| {run.name} | `{run.info.get('measured', '?')}` | {'yes' if run.valid else '**no**'} | {', '.join(run.reasons()) or '–'} | "
                    f"{run.info.get('statisticsMode') or '–'} | {'–' if delay is None else f'{delay / 1000:.1f} s'} | "
                    f"{in_time} | "
                    f"{' / '.join('–' if value is None else f'{value:.0f}' for value in failed)} |")
     out.append("")
+
+    if any(run.control for run in runs):
+        out += ["### Control workflow (D20): request duration (ms)", "",
+                "Text exercise submission by the same students before the quiz: start the exercise, open the editor, submit "
+                "twice. It touches no quiz code; a difference between the sides is unrelated drift (D2).", "",
+                "| Run | Request | n | Median | p95 | p99 | Max |", "|---|---|---|---|---|---|---|"]
+        out += duration_rows(runs, 0, CONTROL_TYPES)
+        out.append("")
 
     out += ["### Phase 1: request duration (ms)", "", "p99 only with at least 100 observations (D38 rule 4).", "",
             "| Run | Request | n | Median | p95 | p99 | Max |", "|---|---|---|---|---|---|---|"]
@@ -256,15 +274,14 @@ def run_set_section(folder, label, rng):
         out.append("")
 
     out += ["### Server, database, and k6", "",
-            "Peaks of the samples every 5 s, from the start of Phase 1 to the start of Phase 3 (window 1–2) and from the start "
-            "of Phase 3 to the end of the samples (window 3). Rows: `pg_stat_user_tables` between the start of Phase 1 and "
-            "15 s after Phase 2 (window 1–2: Phase 1, the evaluation, and Phase 2), and from there to 15 s after Phase 3.", "",
+            "Peaks of the samples every 5 s per window: the control workflow (from its start to its end), Phases 1 and 2 (to the "
+            "start of Phase 3), and Phase 3 (to the end of the samples). Rows and CPU steal: from the snapshot before the window "
+            "to the snapshot before the next one, each 15 s after the end of the window (window 1–2: Phase 1, the evaluation, "
+            "and Phase 2).", "",
             "| Run | Window | Artemis CPU, memory | PostgreSQL CPU, memory | k6 CPU, memory | Lock waits | Active connections | CPU steal ticks | Rows ins / upd / del |",
             "|---|---|---|---|---|---|---|---|---|"]
     for run in runs:
-        windows = [("1–2", run.window(False), ("pg-stat-before.csv", "pg-stat-after.csv"), ("proc-stat-before.txt", "proc-stat-after.txt"))]
-        if run.window(True):
-            windows.append(("3", run.window(True), ("pg-stat-after.csv", "pg-stat-after-phase3.csv"), ("proc-stat-after.txt", "proc-stat-after-phase3.txt")))
+        windows = run.windows()
         for label, window, pg, proc in windows:
             cells, locks, active = run.resources(limits, window)
             rows = run.rows(*pg)
@@ -277,7 +294,10 @@ def run_set_section(folder, label, rng):
             "(D38 rule 3). Change: B against A, from the medians.", "",
             "| Metric | A | B | Change |", "|---|---|---|---|"]
     valid = {side: [run for run in side_runs[side] if run.valid] for side in "AB"}
-    metrics = [(f"Phase 1 {type_} p95 (ms)", lambda run, t=type_: trend(run.phase1, f"http_req_duration{{type:{t}}}").get("p(95)")) for type_ in PHASE1_TYPES]
+    metrics = []
+    if any(run.control for run in runs):
+        metrics += [(f"Control {type_.removeprefix('control-')} p95 (ms)", lambda run, t=type_: trend(run.control, f"http_req_duration{{type:{t}}}").get("p(95)")) for type_ in CONTROL_TYPES]
+    metrics += [(f"Phase 1 {type_} p95 (ms)", lambda run, t=type_: trend(run.phase1, f"http_req_duration{{type:{t}}}").get("p(95)")) for type_ in PHASE1_TYPES]
     metrics.append(("Evaluation (s)", lambda run: None if run.info.get("evaluationMillis") is None else run.info["evaluationMillis"] / 1000))
     if has_phase2:
         metrics += [(f"Phase 2 {type_} p95 (ms)", lambda run, t=type_: trend(run.phase2, f"http_req_duration{{type:{t}}}").get("p(95)")) for type_ in PHASE2_TYPES]
@@ -315,6 +335,7 @@ def main():
         sections += lines
         parameters = load(folder / "parameters.json") or {}
         phases = "1, 2, and 3" if any(run.phase3 for run in runs) else "1 and 2" if any(run.phase2 for run in runs) else "1"
+        phases = f"control, {phases}" if any(run.control for run in runs) else phases
         overview.append(f"| {label} | {parameters.get('students')} | {phases} | "
                         f"{sum(run.valid for run in runs)} of {len(runs)} | `{str(parameters.get('toolRevision', ''))[:11]}` | {parameters.get('startedAt')} |")
 
