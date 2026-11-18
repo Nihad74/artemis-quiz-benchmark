@@ -37,17 +37,17 @@ export JAVA_HEAP="${JAVA_HEAP:--Xms2g -Xmx2g}"
 source "$here/lib/stack.sh"
 
 first="${images[0]}"
-seed_commit="${SEED_COMMIT:-43bafcee17c}"
-label="$(docker image inspect "$first" --format '{{index .Config.Labels "thesis.commit"}}')"
-if [[ "$label" != "$seed_commit" ]]; then
-    echo "the seed runs on the relational baseline $seed_commit, but $first is built from ${label:-an unknown commit}" >&2
-    exit 2
-fi
 # Every image starts by the id it has now, so a tag that moves during the check changes nothing (D44).
 declare -A image_id=()
 for image in "${images[@]}"; do
     image_id[$image]="$(docker image inspect "$image" --format '{{.Id}}')"
 done
+seed_commit="${SEED_COMMIT:-43bafcee17c}"
+label="$(docker image inspect "${image_id[$first]}" --format '{{index .Config.Labels "thesis.commit"}}')"
+if [[ "$label" != "$seed_commit" ]]; then
+    echo "the seed runs on the relational baseline $seed_commit, but $first is built from ${label:-an unknown commit}" >&2
+    exit 2
+fi
 server() { compose "${image_id[$1]}" "${@:2}"; }
 server "$first" down -v --remove-orphans >/dev/null 2>&1 || true
 for image in "${images[@]}"; do echo "$image ${image_id[$image]}"; done >"$out/images.txt"

@@ -21,11 +21,11 @@
  *     or missing reference.
  *
  *   node judge.mjs complete <out> <repetitions>
- *     Writes <out>/complete.json (atomically) only if every side has <repetitions> runs and none is invalid: each run is
- *     either a valid measurement or a failure of the server. Exit status 1 otherwise. A result set additionally needs 5
- *     repetitions (D6); night.sh and report.py check that.
+ *     Writes <out>/complete.json (atomically) only with <repetitions> valid runs per side. A failed server run is
+ *     recorded separately in failure.json and never counts towards completion. Exit status 1 otherwise. A campaign
+ *     result set needs at least five valid runs per side; night.sh and report.py check that independently.
  */
-import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { expectedResultErrors } from './lib/expected.mjs';
 
 const read = (path) => (existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : null);
@@ -239,7 +239,8 @@ function judgeComplete(out, repetitions) {
     const runs = readdirSync(out)
         .filter((name) => /^\d+-[AB]$/.test(name))
         .map((name) => ({ name, side: name.split('-')[1], run: read(`${out}/${name}/run.json`) }));
-    const count = (side, outcome) => runs.filter((entry) => entry.side === side && (entry.run?.outcome ?? 'invalid') === outcome).length;
+    const count = (side, outcome) => runs.filter((entry) => entry.side === side && (entry.run?.outcome ?? 'invalid') === outcome
+        && (outcome !== 'valid' || entry.run.valid === true)).length;
     const state = {
         repetitions,
         validA: count('A', 'valid'),
@@ -249,10 +250,18 @@ function judgeComplete(out, repetitions) {
         runs: runs.length,
         invalid: runs.filter((entry) => (entry.run?.outcome ?? 'invalid') === 'invalid').map((entry) => entry.name),
     };
-    const complete =
-        state.invalid.length === 0 && state.validA + state.failedA >= repetitions && state.validB + state.failedB >= repetitions;
+    const complete = Number.isInteger(repetitions) && repetitions > 0 &&
+        state.invalid.length === 0 && state.validA >= repetitions && state.validB >= repetitions;
     console.log(JSON.stringify({ complete, ...state }));
     if (!complete) {
+        rmSync(`${out}/complete.json`, { force: true });
+        if (state.failedA || state.failedB) {
+            writeAtomic(`${out}/failure.json`, {
+                ...state,
+                evidence: runs.filter((entry) => entry.run?.outcome === 'failed')
+                    .map((entry) => ({ run: entry.name, reasons: entry.run.serverReasons })),
+            });
+        }
         process.exit(1);
     }
     writeAtomic(`${out}/complete.json`, { ...state, completedAt: new Date().toISOString() });

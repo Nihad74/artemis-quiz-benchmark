@@ -2,8 +2,8 @@
 # Runs the Track B result sets of one comparison (D40), for example in one night: every scale in turn, each a run.sh run
 # set with 5 runs per side. A scale is skipped only if its run set belongs to this campaign and is finished: its
 # parameters.json names the campaign file (inputs.json, by SHA-256), the sides and Phase 3 of the comparison, the scale,
-# and 5 repetitions, and its complete.json counts 5 judged runs per side and no invalid run. A judged run is valid or a
-# failure of the server (judge.mjs, D44): a server failure is evidence against the hypothesis and is not measured again.
+# and 5 repetitions, and both complete.json and the actual run records show 5 valid runs per side. Failed server runs
+# remain separate evidence (failure.json); they block completion and are retained without automatic retry. Exit 1.
 # Any other folder of that scale (a pilot, an interrupted set, a set with an invalid run) is moved aside as
 # <scale>.attempt-<time> and kept; the scale is measured again from its first run. Needs Bash 5.
 #
@@ -100,17 +100,41 @@ fi
 campaign="$results/inputs.json"
 campaign_hash="$( [[ -e "$campaign" ]] && sha256 "$campaign" || echo none)"
 
-# finished <out> <students>: the run set in <out> is a finished run set of this campaign (see the header).
+# Check both the campaign identity and the recorded inputs. Copying only a campaign hash cannot authorize different inputs.
+matching_inputs() {
+    [[ -f "$1/parameters.json" && -f "$campaign" ]] || return 1
+    jq -es --arg hash "$campaign_hash" --arg a "$side_a" --arg b "$side_b" --argjson phase3 "$phase3" --argjson students "$2" '
+        .[0] as $p | .[1] as $f
+        | $p.campaign.sha256 == $hash and $p.toolRevision == $f.toolRevision
+          and $p.settings == $f.settings and $p.seedHashes == $f.seed
+          and ($p.sideA | join(",")) == $a and ($p.sideB | join(",")) == $b
+          and $p.phase3 == ($phase3 == 1) and $p.students == $students and $p.repetitions == 5
+          and all(($p.sideA + $p.sideB)[]; . as $image | $p.images[$image] != null and $p.images[$image] == $f.images[$image])
+        ' "$1/parameters.json" "$campaign" >/dev/null 2>&1
+}
+
 finished() {
-    [[ -e "$1/complete.json" && -e "$1/parameters.json" ]] || return 1
-    jq -es --arg campaign "$campaign_hash" --arg a "$side_a" --arg b "$side_b" --argjson phase3 "$phase3" \
-        --argjson students "$2" '
-        .[0] as $p | .[1] as $c
-        | $p.campaign.sha256 == $campaign and ($p.sideA | join(",")) == $a and ($p.sideB | join(",")) == $b
-          and ($p.phase3 == ($phase3 == 1)) and $p.students == $students and $p.repetitions == 5
-          and $c.repetitions == 5 and ($c.invalid | length) == 0
-          and $c.validA + $c.failedA >= 5 and $c.validB + $c.failedB >= 5' \
-        "$1/parameters.json" "$1/complete.json" >/dev/null 2>&1
+    [[ -f "$1/complete.json" ]] && matching_inputs "$1" "$2" || return 1
+    jq -e '.repetitions == 5 and .validA >= 5 and .validB >= 5 and (.invalid | length) == 0' "$1/complete.json" >/dev/null || return 1
+    # Recount the actual run records; the marker alone is not evidence of five valid runs.
+    local records=("$1"/[0-9]*-[AB]/run.json)
+    [[ -f "${records[0]}" ]] || return 1
+    jq -es --slurpfile p "$1/parameters.json" '
+        def valid($side):
+            [.[] | select(.side == $side and .valid == true and (.outcome // "valid") == "valid")
+             | select(.runningImageId == $p[0].images[.measured] and .plannedImageId == .runningImageId)
+             | .repetition] | unique | length;
+        valid("A") >= 5 and valid("B") >= 5
+    ' "${records[@]}" >/dev/null 2>&1
+}
+
+has_failure_evidence() {
+    [[ ! -f "$1/failure.json" ]] || return 0
+    local record
+    for record in "$1"/[0-9]*-[AB]/run.json; do
+        [[ ! -f "$record" ]] || ! jq -e '.outcome == "failed"' "$record" >/dev/null || return 0
+    done
+    return 1
 }
 
 incomplete=()
@@ -141,6 +165,11 @@ for students in "${scales[@]}"; do
         log "$comparison s$students: finished in this campaign, skipped"
         continue
     fi
+    if has_failure_evidence "$out"; then
+        log "$comparison s$students: server-failure evidence retained; NOT complete; no automatic retry"
+        incomplete+=("s$students")
+        continue
+    fi
     if [[ -e "$out" ]]; then
         aside="$out.attempt-$(date -u +%Y%m%dT%H%M%SZ)"
         mv "$out" "$aside"
@@ -154,7 +183,7 @@ for students in "${scales[@]}"; do
     if finished "$out" "$students"; then
         log "$comparison s$students: finished ($(jq -c '{validA, failedA, validB, failedB}' "$out/complete.json"))"
     else
-        log "$comparison s$students: NOT finished ($(tail -1 "$out.log")); the next night measures it again"
+        log "$comparison s$students: NOT complete ($(tail -1 "$out.log")); server failures are retained without automatic retry"
         incomplete+=("s$students")
     fi
 done

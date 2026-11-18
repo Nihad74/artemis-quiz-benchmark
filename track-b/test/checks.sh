@@ -128,7 +128,7 @@ make_run "$out" 1-B "$good" 1
 judge "$out" 1-B
 expect "a k6 error (exit 1) makes the run invalid" "$(field "$out" 1-B .outcome)" invalid
 
-# 6. Completion: no invalid run, and enough judged runs per side; a failed run counts as judged.
+# 6. Only valid runs count towards completion. Server failures stay separate as failure.json.
 out="$work/complete"
 new_set "$out"
 make_run "$out" 1-A "$good"
@@ -139,11 +139,12 @@ judge "$out" 1-B
 status=0
 node "$here/judge.mjs" complete "$out" 2 >/dev/null || status=$?
 expect "an under-replicated set is not complete" "$status/$(exists "$out/complete.json")" 1/no
-node "$here/judge.mjs" complete "$out" 1 >/dev/null
-expect "a set with a valid and a failed run is complete" "$(jq -c '[.validA, .failedB]' "$out/complete.json")" "[1,1]"
+status=0
+node "$here/judge.mjs" complete "$out" 1 >/dev/null || status=$?
+expect "a server failure cannot complete a valid-run set" "$status/$(exists "$out/complete.json")/$(exists "$out/failure.json")" 1/no/yes
 make_run "$out" 2-A "$good" 1
 judge "$out" 2-A
-rm "$out/complete.json"
+echo '{"repetitions":1,"validA":1,"validB":1}' >"$out/complete.json"
 status=0
 node "$here/judge.mjs" complete "$out" 1 >/dev/null || status=$?
 expect "a set with an invalid run is not complete" "$status/$(exists "$out/complete.json")" 1/no
@@ -165,9 +166,9 @@ judge "$out" 1-B
 expect "a complete run above the H3 bound stays valid" "$(field "$out" 1-A .outcome)" valid
 expect "an incomplete freshness measurement is invalid" "$(field "$out" 1-B .outcome)" invalid
 
-# 8. Replay of the saved f3463b75408 collapse (final pilot, json-answers 1-B): a server failure, kept as evidence, and a
-#    result set built from it fails H2 in the report. Provenance and settings are not recorded in that pilot, so the
-#    fixture adds matching ones; the outcome comes from the saved thresholds, evaluation, and semantics.
+# 8. Replay the saved f3463b75408 workload failure. Its latencies cannot complete a result set. The historical pilot lacks
+#    container facts, so the fixture supplies matching synthetic facts. Only outcome classification is replayed;
+#    this is not new provenance evidence.
 replay="$work/replay"
 mkdir -p "$replay"
 jq --argjson settings "$settings" '.settings = $settings | .repetitions = 5 | .images[.sideA[-1]] = "sha256:abc" | .images[.sideB[-1]] = "sha256:abc"' \
@@ -189,10 +190,12 @@ expect "its reasons name the failed submissions and the missing evaluation" \
 for repetition in 2 3 4 5; do
     for side in A B; do ln -s "$replay/1-$side" "$replay/$repetition-$side"; done
 done
-node "$here/judge.mjs" complete "$replay" 5 >/dev/null
+status=0
+node "$here/judge.mjs" complete "$replay" 5 >/dev/null || status=$?
+expect "five server failures remain evidence, never five valid runs" "$status/$(exists "$replay/complete.json")/$(exists "$replay/failure.json")" 1/no/yes
 python3 "$here/report.py" --out "$work/replay.md" "$replay" >/dev/null
-expect "the report fails H2 for a result set whose candidate failed the workload" \
-    "$(grep -c '^| H2 submit p95 B/A .*\*\*fails\*\*: side B failed the workload in 5 of 5 runs' "$work/replay.md")" 1
+expect "failure evidence gets no latency verdict" \
+    "$(grep -c '^| H2 submit p95 B/A .*side B failed 5 of 5.*no verdict (incomplete)' "$work/replay.md")" 1
 
 # 9. Report verdicts only for a result set of the targeted pair at 2000 students (D16, D37, D44).
 stats="$final/stats-on-demand/s2000"
@@ -202,7 +205,12 @@ fake_set() {
     jq --argjson students "$students" --argjson repetitions "$repetitions" '.students = $students | .repetitions = $repetitions' \
         "$stats/parameters.json" >"$out/parameters.json"
     for repetition in $(seq "$repetitions"); do
-        for side in A B; do ln -s "$stats/1-$side" "$out/$repetition-$side"; done
+        for side in A B; do
+            for file in run.json phase1/summary.json phase2/summary.json phase3/summary.json phase3/phase3.json phase3/freshness.json; do
+                mkdir -p "$(dirname "$out/$repetition-$side/$file")"
+                cp "$stats/1-$side/$file" "$out/$repetition-$side/$file"
+            done
+        done
     done
     jq -n --argjson r "$repetitions" '{repetitions: $r, validA: $r, failedA: 0, validB: $r, failedB: 0, invalid: []}' >"$out/complete.json"
 }
@@ -217,6 +225,23 @@ expect "the H3 pair gives verdicts from a 2000-student result set" \
 expect "H3 reads the initial reads, 5 overview observations per run" \
     "$(grep -c '^| H3 statistics-overview initial p95 (ms) | [0-9.]* | 5 | < 1000 | holds |' "$work/s2000.md")" 1
 expect "the H3 pair gives no H2 verdict" "$(grep -c '^| H2 .*no verdict (not the H2 pair)' "$work/s2000.md")" 1
+for repetition in 1 2 3 4 5; do
+    summary="$work/s2000/$repetition-B/phase2/summary.json"
+    jq '.metrics["http_req_duration{type:statistics-overview,read:initial}"].values["p(95)"] = 1500
+        | .metrics["http_req_duration{type:statistics-overview,read:repeated}"].values["p(95)"] = 1' "$summary" >"$work/summary.json"
+    mv "$work/summary.json" "$summary"
+done
+python3 "$here/report.py" --out "$work/initial-slow.md" "$work/s2000" >/dev/null
+expect "slow initial reads fail H3 even when repeated reads are fast" \
+    "$(grep -c '^| H3 statistics-overview initial p95 (ms) | 1500.0 | 5 | < 1000 | \*\*fails\*\* |' "$work/initial-slow.md")" 1
+for repetition in 1 2 3 4 5; do
+    summary="$work/s2000/$repetition-B/phase2/summary.json"
+    jq 'del(.metrics["http_req_duration{type:statistics-overview,read:initial}"])' "$summary" >"$work/summary.json"
+    mv "$work/summary.json" "$summary"
+done
+python3 "$here/report.py" --out "$work/no-initial.md" "$work/s2000" >/dev/null
+expect "missing initial reads cannot be replaced with repeated reads for H3" \
+    "$(grep -c '^| H3 statistics-overview initial p95 .*untested: fewer than five' "$work/no-initial.md")" 1
 
 # 10. Compose reads no ambient environment files; exported settings are recorded and frozen instead.
 printf 'ARTEMIS_DB_POOL_SIZE=12\nPOSTGRES_MEMORY=2g\n' >"$work/ambient.env"
@@ -257,12 +282,36 @@ if committed; then
     status=0
     message="$(NIGHT_CHECK=1 SEED_FOLDER="$seed" RESULTS="$work/night" "$here/night.sh" e2e 2000 2>&1)" || status=$?
     expect "a copied one-run pilot with complete.json is not a finished scale" "$status/$(grep -c 's2000: not finished' <<<"$message")" 1/1
-    jq --arg sha "$(shasum -a 256 "$work/night/inputs.json" | cut -d' ' -f1)" '.campaign = {sha256: $sha} | .repetitions = 5' \
-        "$final/e2e/s2000/parameters.json" >"$work/night/e2e/s2000/parameters.json"
+    jq --slurpfile f "$work/night/inputs.json" --arg sha "$(shasum -a 256 "$work/night/inputs.json" | cut -d' ' -f1)" '
+        .campaign = {sha256: $sha} | .repetitions = 5 | .toolRevision = $f[0].toolRevision
+        | .settings = $f[0].settings | .seedHashes = $f[0].seed | .images = $f[0].images
+        ' "$final/e2e/s2000/parameters.json" >"$work/night/e2e/s2000/parameters.json"
     echo '{"repetitions":5,"validA":5,"failedA":0,"validB":3,"failedB":2,"invalid":[]}' >"$work/night/e2e/s2000/complete.json"
     status=0
+    NIGHT_CHECK=1 SEED_FOLDER="$seed" RESULTS="$work/night" "$here/night.sh" e2e 2000 >/dev/null 2>&1 || status=$?
+    expect "server failures cannot authorize a campaign skip" "$status" 1
+    echo '{"repetitions":5,"validA":5,"validB":5,"invalid":[]}' >"$work/night/e2e/s2000/complete.json"
+    status=0
+    NIGHT_CHECK=1 SEED_FOLDER="$seed" RESULTS="$work/night" "$here/night.sh" e2e 2000 >/dev/null 2>&1 || status=$?
+    expect "an inflated completion marker cannot replace actual run records" "$status" 1
+    for repetition in 1 2 3 4 5; do
+        for side in A B; do
+            mkdir -p "$work/night/e2e/s2000/$repetition-$side"
+            jq --argjson repetition "$repetition" --arg side "$side" --slurpfile f "$work/night/inputs.json" '
+                .repetition = $repetition | .side = $side | .outcome = "valid"
+                | .runningImageId = $f[0].images[.measured] | .plannedImageId = .runningImageId
+                ' "$final/e2e/s2000/1-$side/run.json" >"$work/night/e2e/s2000/$repetition-$side/run.json"
+        done
+    done
+    status=0
     message="$(NIGHT_CHECK=1 SEED_FOLDER="$seed" RESULTS="$work/night" "$here/night.sh" e2e 2000 2>&1)" || status=$?
-    expect "a finished campaign set, failures included, is skipped" "$status/$(grep -c 's2000: finished' <<<"$message")" 0/1
+    expect "five valid runs matching campaign inputs authorize a skip" "$status/$(grep -c 's2000: finished' <<<"$message")" 0/1
+    cp "$work/night/e2e/s2000/parameters.json" "$work/unchanged.json"
+    jq '.settings.run.rounds = 1' "$work/unchanged.json" >"$work/night/e2e/s2000/parameters.json"
+    status=0
+    NIGHT_CHECK=1 SEED_FOLDER="$seed" RESULTS="$work/night" "$here/night.sh" e2e 2000 >/dev/null 2>&1 || status=$?
+    expect "a matching campaign hash does not authorize changed settings" "$status" 1
+    cp "$work/unchanged.json" "$work/night/e2e/s2000/parameters.json"
     status=0
     NIGHT_CHECK=1 SEED_FOLDER="$seed" RESULTS="$work/night" "$here/night.sh" e2e 1000 2000 >/dev/null 2>&1 || status=$?
     expect "night.sh exits 1 if a requested scale is not finished" "$status" 1

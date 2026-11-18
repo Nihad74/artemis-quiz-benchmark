@@ -15,7 +15,7 @@ every run has at least 100 observations (D38 rule 4).
 
 A run has an outcome (judge.mjs, D44): valid, failed (the server failed the workload: evidence against the hypothesis,
 never a latency sample), or invalid (the measurement cannot be trusted). A run set is a result set only if complete.json
-exists, it has at least 5 repetitions, and every run is valid or failed (D6); a complete set with fewer repetitions is a
+exists, it has at least five valid runs per side, and no failed or invalid run (D6); fewer valid repetitions form a
 complete pilot. Hypothesis verdicts (D16, D44) are given only for a result set of the targeted pair of the hypothesis
 (D37) at 2000 students; every other run set shows the same values as an illustration, without a verdict. H3 reads the
 statistics directly after the evaluation: the initial reads of Phase 2 (5 observations of the overview and the points
@@ -58,12 +58,13 @@ def set_state(folder, parameters, runs):
     counts = {side: {outcome: sum(run.side == side and run.outcome == outcome for run in runs) for outcome in ("valid", "failed", "invalid")} for side in "AB"}
     text = "; ".join(f"side {side}: {c['valid']} valid, {c['failed']} failed, {c['invalid']} invalid" for side, c in counts.items())
     repetitions = parameters.get("repetitions") or 0
-    if complete and repetitions >= MIN_RUNS and all(c["invalid"] == 0 and c["valid"] + c["failed"] >= MIN_RUNS for c in counts.values()):
+    sufficient = all(c["valid"] >= MIN_RUNS and c["invalid"] == 0 and c["failed"] == 0 for c in counts.values())
+    if complete and repetitions >= MIN_RUNS and sufficient and complete.get("repetitions", 0) >= MIN_RUNS:
         return "result set", f"**Result set** (complete.json, {repetitions} repetitions): {text}."
-    if complete:
+    if complete and 0 < repetitions < MIN_RUNS and all(c["valid"] >= repetitions for c in counts.values()):
         return "complete pilot", (f"**Complete pilot** ({repetitions} repetition{'s' if repetitions != 1 else ''}, fewer than {MIN_RUNS}, D6): "
                                   f"{text}. For orientation only; no result set and no verdict.")
-    return "incomplete", f"**Incomplete attempt** (no complete.json): {text}. For orientation only; no result set and no verdict."
+    return "incomplete", f"**Incomplete attempt:** {text}. Server failures remain evidence, not latency samples or completed result sets; no statistical verdict."
 
 
 def load(path):
@@ -317,6 +318,13 @@ def run_set_section(folder, label, rng):
                    f"{run.info.get('statisticsMode') or '–'} | {'–' if delay is None else f'{delay / 1000:.1f} s'} | "
                    f"{in_time} | "
                    f"{' / '.join('–' if value is None else f'{value:.0f}' for value in failed)} |")
+    for run in runs:
+        attempted = trend(run.phase1, "http_req_duration{type:submit}").get("count", 0)
+        successful = count(run.phase1, "phase1_submitted_in_time")
+        if attempted and successful == 0:
+            out.append(f"**Failure evidence ({run.name}):** {attempted:.0f} submit attempts; none succeeded in time. "
+                       "The request durations are not successful-submit latency samples. This evidence is retained independently of completion.")
+    out.append("")
     out += ["", "Phase 2 first request: from the end of the evaluation (D17 log line) to the first statistics request of a tutor; "
             "run sets before 2026-11-18 show the end of the Phase 2 setup instead.", ""]
 
@@ -470,8 +478,8 @@ def run_set_section(folder, label, rng):
             f"A verdict only for a result set of the targeted pair of the hypothesis (D37: `43bafcee17c` → `f3463b75408` for H2, "
             f"`c136826e299` → `24a062759c2` for H3) at {VERDICT_STUDENTS} students (D16). Every other run set shows the values "
             "as an illustration, without a verdict; the end-to-end comparison shows version differences, not the effect of a "
-            "commit. A side B run that failed the workload counts against the hypothesis (D38 rule 1, D44); a side A failure "
-            "leaves it untested. H2: ratio B/A of the per-run submit p95 over the valid runs, 95% bootstrap interval; holds "
+            "commit. Server failures remain separate regression evidence, never completed latency samples. H2: ratio B/A "
+            "of the per-run submit p95 over five valid runs per side, 95% bootstrap interval; holds "
             "if the upper limit is at most 1.10. H3 statistics: the initial reads of Phase 2, directly after the evaluation "
             "(D16; each tutor's first round, 5 observations of the overview and the points page and 50 of the question pages "
             "per run, so a per-run p95 of the overview is close to its maximum); upper limit of the 95% bootstrap interval of "
@@ -493,16 +501,14 @@ def run_set_section(folder, label, rng):
             reasons.append(state)
         return f"no verdict ({', '.join(reasons)})" if reasons else None
 
-    def result(hypothesis, holds):
-        """The verdict cell: failures of side B decide first, then side A, then the bound (holds: True, False, or None)."""
+    def result(hypothesis, holds, observations):
+        """Statistical verdicts require the specified comparison, cohort and five valid per-run values."""
         verdict = no_verdict(hypothesis)
         if verdict:
             return verdict
-        if failed_runs["B"]:
-            return f"**fails**: side B failed the workload in {len(failed_runs['B'])} of {len(side_runs['B'])} runs"
-        if failed_runs["A"]:
-            return f"untested: side A failed the workload in {len(failed_runs['A'])} runs"
-        return "untested: fewer than two valid runs per side" if holds is None else ("holds" if holds else "**fails**")
+        if observations < MIN_RUNS:
+            return "untested: fewer than five valid per-run values"
+        return "untested: missing data" if holds is None else ("holds" if holds else "**fails**")
 
     failures = "; ".join(f"side {side} failed {len(failed_runs[side])} of {len(side_runs[side])}" for side in "AB" if failed_runs[side])
     submit = {side: [v for v in (trend(run.phase1, "http_req_duration{type:submit}").get("p(95)") for run in valid[side]) if v is not None] for side in "AB"}
@@ -512,7 +518,7 @@ def run_set_section(folder, label, rng):
         value += f" ({failures})"
     submits = [trend(run.phase1, "http_req_duration{type:submit}").get("count") for run in valid["B"]]
     out.append(f"| H2 submit p95 B/A | {value} | {', '.join(f'{c:.0f}' for c in submits if c) or '–'} | ≤ 1.10 | "
-               f"{result('H2', None if not ratio else ratio[2] <= 1.10)} |")
+               f"{result('H2', None if not ratio else ratio[2] <= 1.10, min(len(submit['A']), len(submit['B'])))} |")
     if has_phase2:
         for type_ in PHASE2_TYPES[:3]:
             values = [trend(run.phase2, f"http_req_duration{{type:{type_},read:initial}}").get("p(95)") for run in valid["B"]]
@@ -521,7 +527,7 @@ def run_set_section(folder, label, rng):
             high = bootstrap_high(values, rng)
             cell = "no initial reads recorded" if not values else (f"{values[0]:.1f} (one run)" if high is None else f"{high:.1f}")
             out.append(f"| H3 {type_} initial p95 (ms) | {cell} | {', '.join(f'{c:.0f}' for c in counts) or '–'} | < 1000 | "
-                       f"{result('H3', None if high is None else high < 1000)} |")
+                       f"{result('H3', None if high is None else high < 1000, len(values))} |")
     if has_phase3:
         values = [(run.freshness or {}).get("p95Millis") for run in valid["B"]]
         censored = any((run.freshness or {}).get("p95Censored") for run in valid["B"])
@@ -529,7 +535,7 @@ def run_set_section(folder, label, rng):
         cell = ("–" if high is None else f"{high:.1f}") + (" (censored)" if censored else "")
         counts = sorted({(run.freshness or {}).get("values") for run in valid["B"]} - {None})
         out.append(f"| H3 freshness p95 (ms) | {cell} | {', '.join(str(c) for c in counts) or '–'} | < 2000 | "
-                   f"{result('H3', None if high is None else (not censored and high < 2000))} |")
+                   f"{result('H3', None if high is None else (not censored and high < 2000), sum(v is not None for v in values))} |")
     else:
         out.append("| H3 freshness p95 (ms) | Phase 3 not run | – | < 2000 | untested (D38 rule 6) |")
     out.append("")

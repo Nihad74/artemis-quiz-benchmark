@@ -43,6 +43,14 @@ REPETITIONS=5 ./run.sh "$results/seed-2000" "$results/e2e-s2000" 2000 \
 python3 report.py --out "$results/results.md" "$results/e2e-s2000"
 ```
 
+Campaign runs start every server by its frozen image ID. Compose ignores ambient `.env` files and `COMPOSE_*` variables.
+`night.sh` skips only matching campaign sets with five valid runs per side. Incomplete requested scales return nonzero.
+Server failures stay separate as evidence (`failure.json`), never latency samples or completed sets; they are not retried
+automatically. `NIGHT_CHECK=1 ./night.sh <comparison>` checks completion without starting a measurement.
+
+H2 and H3 statistical verdicts require their specified pair, 2000 students, and five valid runs per side. H3 uses the
+initial statistics reads after evaluation, with only five overview and five points observations per run.
+
 The usage line at the top of each script lists its parameters and environment variables.
 
 ## Notes

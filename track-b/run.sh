@@ -42,7 +42,8 @@
 # against the hypothesis, never a latency sample); or invalid (the measurement cannot be trusted: another image or other
 # container settings than planned, a k6 or tool error, the load generator behind schedule, an incomplete freshness
 # measurement). The reference of D19 is the first valid run. After the last run, judge.mjs writes complete.json only if
-# no run is invalid; run.sh then exits 0, else 1. runs.tsv lists all runs.
+# every side has REPETITIONS valid runs; otherwise it writes failure.json for server failures and exits 1. No failure
+# counts towards completion. runs.tsv lists all runs.
 #
 # Frozen inputs (D44): every image of both chains is resolved to its id once, at the start, and every server start
 # (migration and measurement) uses that id, never the tag. Compose reads no ambient configuration (lib/stack.sh). The
