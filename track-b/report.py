@@ -173,6 +173,21 @@ def median_with_interval(values, rng):
     return f"{median:.1f} [{low:.1f}, {high:.1f}] (n={len(values)})"
 
 
+def bootstrap_high(values, rng, statistic=statistics.median):
+    """Upper limit of the 95% percentile bootstrap interval over runs, or None with fewer than two runs."""
+    if len(values) < 2:
+        return None
+    return sorted(statistic(rng.choices(values, k=len(values))) for _ in range(BOOTSTRAP))[int(0.975 * BOOTSTRAP) - 1]
+
+
+def ratio_interval(a, b, rng):
+    """Median ratio B/A of per-run values and its 95% bootstrap interval, resampling the runs of each side apart."""
+    if len(a) < 2 or len(b) < 2 or not statistics.median(a):
+        return None
+    ratios = sorted(statistics.median(rng.choices(b, k=len(b))) / statistics.median(rng.choices(a, k=len(a))) for _ in range(BOOTSTRAP))
+    return statistics.median(b) / statistics.median(a), ratios[int(0.025 * BOOTSTRAP)], ratios[int(0.975 * BOOTSTRAP) - 1]
+
+
 def phase2_metric(summary, type_, read):
     """A Phase 2 metric of one read; run sets before the read tag (2026-11-18) have only the untagged metric."""
     tagged = trend(summary, f"http_req_duration{{type:{type_},read:{read}}}")
@@ -419,6 +434,39 @@ def run_set_section(folder, label, rng):
         if per_side["A"] and per_side["B"] and statistics.median(per_side["A"]):
             change = f"{(statistics.median(per_side['B']) / statistics.median(per_side['A']) - 1) * 100:+.1f}%"
         out.append(f"| {name} | {median_with_interval(per_side['A'], rng)} | {median_with_interval(per_side['B'], rng)} | {change} |")
+    out.append("")
+
+    out += ["### Hypothesis checks (D16, D43)", "",
+            "Computed from the valid runs; an assessment only for a complete run set (pilots: illustration only). D16 sets the "
+            "bounds at 2000 students; at the other scales the rows describe scaling. Causal claims only from the targeted pair "
+            "of the hypothesis (D37): `f3463b75408` for H2, `24a062759c2` for H3; the end-to-end comparison shows version "
+            "differences. H2: ratio B/A of the per-run submit p95 with its 95% bootstrap interval; not worse if the upper limit "
+            "is at most 1.10. H3: upper limit of the 95% bootstrap interval of the per-run p95 on side B; a freshness p95 among "
+            "censored values counts as above the bound.", "",
+            "| Check | Value | Bound | Result |", "|---|---|---|---|"]
+    state = "" if (folder / "complete.json").exists() else " (pilot)"
+    submit = {side: [v for v in (trend(run.phase1, "http_req_duration{type:submit}").get("p(95)") for run in valid[side]) if v is not None] for side in "AB"}
+    ratio = ratio_interval(submit["A"], submit["B"], rng)
+    if ratio:
+        out.append(f"| H2 submit p95 B/A | {ratio[0]:.3f} [{ratio[1]:.3f}, {ratio[2]:.3f}] | ≤ 1.10 | {'holds' if ratio[2] <= 1.10 else 'fails'}{state} |")
+    else:
+        out.append("| H2 submit p95 B/A | fewer than two valid runs per side | ≤ 1.10 | untested |")
+    if has_phase2:
+        for type_ in PHASE2_TYPES:
+            if type_ == "statistics-footer":
+                continue
+            values = [v for v in (phase2_metric(run.phase2, type_, "repeated").get("p(95)") for run in valid["B"]) if v is not None]
+            high = bootstrap_high(values, rng)
+            out.append(f"| H3 {type_} p95, side B (ms) | {'fewer than two valid runs' if high is None else f'{high:.1f}'} | < 1000 | "
+                       f"{'untested' if high is None else ('holds' if high < 1000 else 'fails') + state} |")
+    if has_phase3:
+        values = [(run.freshness or {}).get("p95Millis") for run in valid["B"]]
+        censored = any((run.freshness or {}).get("p95Censored") for run in valid["B"])
+        high = bootstrap_high([v for v in values if v is not None], rng)
+        result = "untested" if high is None else ("fails" if censored or high >= 2000 else "holds") + state
+        out.append(f"| H3 freshness p95, side B (ms) | {'fewer than two valid runs' if high is None else f'{high:.1f}'}{' (censored)' if censored else ''} | < 2000 | {result} |")
+    else:
+        out.append("| H3 freshness p95, side B (ms) | Phase 3 not run | < 2000 | untested (D38 rule 6) |")
     out.append("")
     return out, runs
 

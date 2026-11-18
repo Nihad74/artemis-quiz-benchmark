@@ -92,6 +92,25 @@ expect "an under-replicated set is not complete" "$status/$([[ -e "$out/complete
 node "$here/judge.mjs" complete "$out" 1 >/dev/null
 expect "a set with every run valid is complete" "$(jq .validA "$out/complete.json")" 1
 
+# 5b. A complete Phase 3 run whose freshness exceeds the H3 bound stays valid: it is evidence against H3 (D42, D43).
+#     An incomplete freshness measurement makes the run invalid.
+phase3_pilot="$(dirname "$pilot")/pilot-mac-2026-11-18-control/s2000/1-B"
+out="$work/h3"
+mkdir -p "$out"
+jq -n --arg seed "$(dirname "$pilot")/seed-2000-2026-11-18" '{seed: $seed, students: 2000}' >"$out/parameters.json"
+for name in 1-A 1-B; do
+    make_run "$out" "$name" "$phase3_pilot/semantics.json"
+    jq '.phase3Run = true | .phase3Exit = 0 | .freshnessExit = 0' "$out/$name/exits.json" >"$work/exits.json" && mv "$work/exits.json" "$out/$name/exits.json"
+    mkdir -p "$out/$name/phase3"
+    cp "$phase3_pilot/phase3/phase3.json" "$out/$name/phase3/"
+done
+echo '{"complete":true,"errors":[],"p95Millis":3500,"p95Censored":true}' >"$out/1-A/phase3/freshness.json"
+echo '{"complete":false,"errors":["tutor 3 never subscribed"]}' >"$out/1-B/phase3/freshness.json"
+node "$here/judge.mjs" run "$out" "$out/1-A" >/dev/null
+node "$here/judge.mjs" run "$out" "$out/1-B" >/dev/null
+expect "a complete run above the H3 bound stays valid" "$(jq .valid "$out/1-A/run.json")" true
+expect "an incomplete freshness measurement is invalid" "$(jq .valid "$out/1-B/run.json")" false
+
 # 6. run.sh refuses a used output folder.
 mkdir -p "$work/used" && touch "$work/used/old"
 status=0

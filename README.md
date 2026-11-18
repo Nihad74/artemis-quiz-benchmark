@@ -18,12 +18,14 @@ same seeded and migrated database, with fixed CPU sets and memory limits.
 | `prepare.sh` | Clones Artemis, creates a worktree for each commit, applies the evaluation timer from `patches/`, and builds the server images (`build-image.sh`). |
 | `check-host.sh` | Checks that the CPU sets and memory limits fit the Docker engine and records the host facts. |
 | `migration-check.sh` | Seeds the baseline, migrates the database forward, and checks that the quiz results stay the same. Its output folder is the seed of the runs. |
-| `run.sh` | Runs both sides in turn (A, B, A, B) and writes the raw files of each run. |
-| `report.py` | Writes a Markdown report from the run folders. |
+| `run.sh` | Runs both sides in balanced order (A B, B A, ...), writes the raw files of each run, judges each run (`judge.mjs`), and writes `complete.json` when every side has enough valid runs. |
+| `night.sh` | Runs one comparison at all scales overnight with frozen inputs (seed hashes, image ids, settings). |
+| `report.py` | Writes a Markdown report from the run folders, including failed runs and the hypothesis checks. |
+| `test/checks.sh` | Regression checks of run validity, completion, frozen inputs, and the freshness measurement, without a server. |
 
 ### Requirements
 
-Docker with Compose v2, bash 4 or later, git, Node 24, `jq`, `curl`, Python 3, and a JDK for Gradle. The default CPU
+Docker with Compose v2, Bash 5 or later (macOS ships Bash 3.2; install it with Homebrew), git, Node 24, `jq`, `curl`, Python 3, and a JDK for Gradle. The default CPU
 sets need 14 CPUs in the Docker engine; set `ARTEMIS_CPUSET`, `POSTGRES_CPUSET`, and `K6_CPUSET` on other hosts.
 
 ### Usage
@@ -34,7 +36,7 @@ results=~/track-b-results
 
 ./prepare.sh ~/artemis-track-b
 ./check-host.sh "$results/host.json"
-./migration-check.sh "$results/seed-2000" 2000 \
+EVALUATED_DURATION=300 ./migration-check.sh "$results/seed-2000" 2000 \
     artemis-thesis:43bafcee17c artemis-thesis:9.9.3 artemis-thesis:8325896e0b4
 REPETITIONS=5 ./run.sh "$results/seed-2000" "$results/e2e-s2000" 2000 \
     artemis-thesis:43bafcee17c artemis-thesis:9.9.3,artemis-thesis:8325896e0b4
