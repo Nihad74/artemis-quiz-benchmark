@@ -4,7 +4,7 @@
 # Usage: check-host.sh [<facts.json>]
 #
 # The Artemis and PostgreSQL limits come from compose.yml with the same variables (ARTEMIS_CPUSET, ARTEMIS_MEMORY,
-# POSTGRES_CPUSET, POSTGRES_MEMORY). The load generator gets K6_CPUSET (default 10-13) and K6_MEMORY (default 4g), and the
+# POSTGRES_CPUSET, POSTGRES_MEMORY). The load generator gets K6_CPUSET (default 10-13) and K6_MEMORY (default 3g), and the
 # Docker VM itself VM_RESERVE (default 1g). Writes the facts as JSON to the given file, else to stdout.
 #
 # Exit status 1 if a CPU set names a CPU the engine does not have, two CPU sets overlap, or the memory limits plus the
