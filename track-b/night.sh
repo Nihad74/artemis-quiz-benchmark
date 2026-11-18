@@ -33,10 +33,9 @@ fi
 here="$(cd "$(dirname "$0")" && pwd)"
 source "$here/lib/inputs.sh"
 source "$here/lib/stack.sh"
-source "$here/lib/k6-limits.sh"
 
 if (($# < 1)); then
-    sed -n '2,13p' "$0" >&2
+    sed -n '2,25p' "$0" >&2
     exit 2
 fi
 comparison="$1"
@@ -79,7 +78,8 @@ if ! git -C "$here" diff --quiet HEAD -- .; then
     echo "track-b/ has uncommitted changes; commit them first, so that every run set records a commit" >&2
     exit 1
 fi
-# Only now: the overrides are refused above, so lib/settings.sh yields the defaults.
+# Only now: the overrides are refused above, so lib/k6-limits.sh and lib/settings.sh yield the defaults.
+source "$here/lib/k6-limits.sh"
 source "$here/lib/settings.sh"
 inputs="$(campaign_inputs "$here" "$seed" "${all_images[@]}")"
 missing="$(jq -r '.images | to_entries[] | select(.value == "") | .key' <<<"$inputs")"
