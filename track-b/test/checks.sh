@@ -297,6 +297,8 @@ expect "the H3 pair gives verdicts from a 2000-student result set" \
 expect "H3 reads the initial reads, 5 overview observations per run" \
     "$(grep -c '^| H3 statistics-overview initial p95 (ms) | [0-9.]* | 5 | < 1000 | holds |' "$work/s2000.md")" 1
 expect "the H3 pair gives no H2 verdict" "$(grep -c '^| H2 .*no verdict (not the H2 pair)' "$work/s2000.md")" 1
+expect "the report draws the A/B chart of a run set under the run set's name and links it" \
+    "$(python3 -c 'import sys, xml.etree.ElementTree as E; E.parse(sys.argv[1]); print("svg")' "$work/s2000-charts/s2000-ab.svg" 2>/dev/null)/$(grep -c '](s2000-charts/s2000-ab.svg)' "$work/s2000.md")" svg/1
 jq '.sideA = ["artemis-thesis:43bafcee17c"] | .sideB = ["artemis-thesis:9.9.3", "artemis-thesis:8325896e0b4"]' \
     "$work/s2000/parameters.json" >"$work/e2e-parameters.json"
 cp "$work/s2000/parameters.json" "$work/h3-parameters.json"

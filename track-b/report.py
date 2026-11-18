@@ -19,7 +19,9 @@ matches the requested repetition and valid-run counts, with exactly that many va
 runs. At least five valid runs per side are required (D6); fewer form a complete pilot. Hypothesis verdicts (D16, D44)
 are given only for a result set of the targeted pair (D37) at 2000 students. Other run sets show the same values as
 an illustration, without a verdict. H3 reads statistics directly after the evaluation: the initial reads of Phase 2
-(5 observations of the overview and the points page per run). Standard library only.
+(5 observations of the overview and the points page per run). Charts (SVG, charts.py) go to <out>-charts/ next to the
+report: per run set side A against side B for the key metrics, and per comparison the medians across scales. They use
+the same per-run values and intervals as the tables. Standard library only.
 """
 
 import argparse
@@ -33,6 +35,8 @@ import statistics
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+
+import charts
 
 CONTROL_TYPES = ["control-start", "control-load", "control-submit"]
 PHASE1_TYPES = ["start-participation", "save", "submit"]
@@ -49,6 +53,26 @@ PRACTICE_RATE_TOLERANCE = 0.05  # D43
 # The comparison whose result set decides the hypothesis: H2 the end-to-end comparison (D45; the targeted pair
 # 43bafcee17c -> f3463b75408 is dropped), H3 the targeted pair of D37.
 HYPOTHESIS_PAIRS = {"H2": ("43bafcee17c", "8325896e0b4"), "H3": ("c136826e299", "24a062759c2")}
+# Charts per run set: (metric name of the A/B table, panel label, bound of the hypothesis in D16 or None).
+CHART_METRICS = [
+    ("Phase 1 submit p95 (ms)", "Phase 1 submit p95 (ms) — H2", None),
+    ("Phase 1 save p95 (ms)", "Phase 1 save p95 (ms)", None),
+    ("Phase 1 start-participation p95 (ms)", "Phase 1 start participation p95 (ms)", None),
+    ("Evaluation (s)", "Evaluation duration (s)", None),
+    ("Time to result p95 (ms)", "Time to result p95 (ms)", None),
+    ("Phase 2 statistics-overview initial p95 (ms)", "Statistics overview, initial reads p95 (ms) — H3", 1000),
+    ("Phase 2 statistics-points initial p95 (ms)", "Statistics points, initial reads p95 (ms) — H3", 1000),
+    ("Phase 2 statistics-question initial p95 (ms)", "Statistics question, initial reads p95 (ms) — H3", 1000),
+    ("Phase 3 freshness p95 (ms, lower bound if censored)", "Statistics freshness p95 (ms; lower bound if censored) — H3", 2000),
+    ("Phase 3 practice-submit p95 (ms)", "Phase 3 practice submit p95 (ms)", None),
+    ("Control submit p95 (ms)", "Control workflow submit p95 (ms) — drift indicator", None),
+]
+# Charts across scales per comparison: a subset of CHART_METRICS.
+SCALING_METRICS = ["Phase 1 submit p95 (ms)", "Evaluation (s)", "Time to result p95 (ms)",
+                   "Phase 2 statistics-overview initial p95 (ms)", "Phase 3 freshness p95 (ms, lower bound if censored)"]
+STATE_RANK = {"result set": 0, "complete pilot": 1, "incomplete": 2}
+CHART_NOTE = ("Valid runs only. Dot: the value of one run; tick: median of the runs; bar: 95% bootstrap interval over "
+              "runs (two runs or more); dashed line: bound of the hypothesis (D16).")
 
 
 def commit_of(chain):
@@ -242,16 +266,28 @@ class Run:
         return last[7] - first[7]
 
 
-def median_with_interval(values, rng):
-    """Median of the per-run values and, with at least two runs, a 95% percentile bootstrap interval over runs."""
+def median_interval(values, rng):
+    """(median, low, high) of the per-run values; low and high form a 95% percentile bootstrap interval over runs and
+    are None with fewer than two runs. None without values."""
     if not values:
-        return "no valid run"
+        return None
     median = statistics.median(values)
     if len(values) < 2:
-        return f"{median:.1f} (n=1)"
+        return median, None, None
     resampled = sorted(statistics.median(rng.choices(values, k=len(values))) for _ in range(BOOTSTRAP))
-    low, high = resampled[int(0.025 * BOOTSTRAP)], resampled[int(0.975 * BOOTSTRAP) - 1]
-    return f"{median:.1f} [{low:.1f}, {high:.1f}] (n={len(values)})"
+    return median, resampled[int(0.025 * BOOTSTRAP)], resampled[int(0.975 * BOOTSTRAP) - 1]
+
+
+def median_with_interval(interval, count):
+    """Table cell of a median_interval result over count runs."""
+    if interval is None:
+        return "no valid run"
+    median, low, high = interval
+    return f"{median:.1f} (n=1)" if low is None else f"{median:.1f} [{low:.1f}, {high:.1f}] (n={count})"
+
+
+def slug(text):
+    return re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-")
 
 
 def bootstrap_high(values, rng, statistic=statistics.median):
@@ -330,7 +366,7 @@ def workload_rows(run):
     return lines
 
 
-def run_set_section(folder, label, rng):
+def run_set_section(folder, label, rng, chart_dir):
     parameters = load(folder / "parameters.json") or {}
     compose = load(folder / "compose.json") or {}
     runs = [Run(path, parameters) for path in sorted(folder.glob("[0-9]*-[AB]"), key=lambda p: (int(p.name.split("-")[0]), p.name))]
@@ -480,11 +516,11 @@ def run_set_section(folder, label, rng):
             "|---|---|---|---|---|---|---|---|---|"]
     for run in runs:
         windows = run.windows()
-        for label, window, pg, proc in windows:
+        for window_label, window, pg, proc in windows:
             cells, locks, active = run.resources(limits, window)
             rows = run.rows(*pg)
             written = "–" if rows is None else f"{rows['n_tup_ins']} / {rows['n_tup_upd']} / {rows['n_tup_del']}"
-            out.append(f"| {run.name} | {label} | {' | '.join(cells)} | {locks} | {active} | {run.steal(*proc)} | {written} |")
+            out.append(f"| {run.name} | {window_label} | {' | '.join(cells)} | {locks} | {active} | {run.steal(*proc)} | {written} |")
     out.append("")
 
     out += ["### Side A against side B (valid runs only)", "",
@@ -522,13 +558,34 @@ def run_set_section(folder, label, rng):
         metrics.append(("Phase 3 freshness p95 (ms, lower bound if censored)", lambda run: (run.freshness or {}).get("p95Millis")))
         metrics.append(("Phase 3 rows written", lambda run: None if run.rows("pg-stat-after.csv", "pg-stat-after-phase3.csv") is None
                         else sum(run.rows("pg-stat-after.csv", "pg-stat-after-phase3.csv").values())))
+    side_values = {}
     for name, value in metrics:
         per_side = {side: [v for v in (value(run) for run in valid[side]) if v is not None] for side in "AB"}
+        intervals = {side: median_interval(per_side[side], rng) for side in "AB"}
+        side_values[name] = {side: (per_side[side], intervals[side]) for side in "AB"}
         change = "–"
         if per_side["A"] and per_side["B"] and statistics.median(per_side["A"]):
             change = f"{(statistics.median(per_side['B']) / statistics.median(per_side['A']) - 1) * 100:+.1f}%"
-        out.append(f"| {name} | {median_with_interval(per_side['A'], rng)} | {median_with_interval(per_side['B'], rng)} | {change} |")
+        out.append(f"| {name} | {median_with_interval(intervals['A'], len(per_side['A']))} | "
+                   f"{median_with_interval(intervals['B'], len(per_side['B']))} | {change} |")
     out.append("")
+    sides = {"A": commit_of(parameters.get("sideA")), "B": commit_of(parameters.get("sideB"))}
+    panels = []
+    for name, panel_label, bound in CHART_METRICS:
+        if name not in side_values or not any(side_values[name][side][0] for side in "AB"):
+            continue
+        panel = {"label": panel_label, "bound": bound}
+        for side in "AB":
+            values, interval = side_values[name][side]
+            if interval:
+                panel[side] = {"values": values, "median": interval[0], "low": interval[1], "high": interval[2]}
+        panels.append(panel)
+    if panels:
+        state_label = set_state(folder, parameters, runs)[0]
+        title = f"{label}: {parameters.get('students')} students, {state_label}"
+        file = chart_dir / f"{slug(label)}-ab.svg"
+        file.write_text(charts.interval_chart(title, sides, panels, CHART_NOTE))
+        out += [f"![Side A against side B, {label}]({chart_dir.name}/{file.name})", ""]
 
     out += ["### Hypothesis checks (D16, D44, D45)", "",
             f"A verdict only for a result set of the comparison of the hypothesis at {VERDICT_STUDENTS} students (D16, D45): "
@@ -608,7 +665,47 @@ def run_set_section(folder, label, rng):
     else:
         out.append("| H3 freshness p95 (ms) | Phase 3 not run | – | < 2000 | untested (D38 rule 6) |")
     out.append("")
-    return out, runs
+    return out, runs, side_values
+
+
+def scaling_section(comparisons, chart_dir):
+    """One chart per comparison measured at two or more scales: the median and interval of each side per scale. At a
+    scale with several run sets, the best state wins (result set, complete pilot, incomplete), then the latest start."""
+    out = []
+    for (side_a, side_b), sets in comparisons.items():
+        chosen = {}
+        for entry in sorted(sets, key=lambda e: (-STATE_RANK.get(e["state"], 3), e["started"])):
+            chosen[entry["students"]] = entry
+        if len(chosen) < 2:
+            continue
+        scales = sorted(chosen)
+        labels = dict((name, label) for name, label, _ in CHART_METRICS)
+        bounds = dict((name, bound) for name, _, bound in CHART_METRICS)
+        panels = []
+        for name in SCALING_METRICS:
+            panel = {"label": labels[name], "bound": bounds[name], "A": {}, "B": {}}
+            for students, entry in chosen.items():
+                for side in "AB":
+                    interval = entry["values"].get(name, {}).get(side, ([], None))[1]
+                    if interval:
+                        panel[side][students] = interval
+            if panel["A"] or panel["B"]:
+                panels.append(panel)
+        if not panels:
+            continue
+        sides = {"A": commit_of(list(side_a)), "B": commit_of(list(side_b))}
+        pilot = any(entry["state"] != "result set" for entry in chosen.values())
+        title = f"{sides['A']} → {sides['B']} across scales{' (includes pilots)' if pilot else ''}"
+        file = chart_dir / f"scaling-{slug(sides['A'])}-{slug(sides['B'])}.svg"
+        file.write_text(charts.scaling_chart(title, sides, scales, panels,
+                                             "Valid runs only. Dot: median of the per-run values; whisker: 95% bootstrap "
+                                             "interval over runs (two runs or more); dashed line: bound of the hypothesis (D16)."))
+        out += [f"## Across scales: `{' → '.join(side_a)}` against `{' → '.join(side_b)}`", "",
+                "Run set per scale (the best state, then the latest): "
+                + "; ".join(f"{s} students: {chosen[s]['label']} ({chosen[s]['state']})" for s in scales)
+                + ". Pilots are for orientation only (D6).", "",
+                f"![Across scales, {sides['A']} against {sides['B']}]({chart_dir.name}/{file.name})", ""]
+    return out
 
 
 def main():
@@ -621,11 +718,16 @@ def main():
     here = Path(__file__).resolve().parent
     revision = subprocess.run(["git", "-C", str(here), "rev-parse", "--short=11", "HEAD"], capture_output=True, text=True).stdout.strip()
     rng = random.Random(1)
+    # The charts of this report only: earlier SVGs in the folder are removed, so none outlives its run set.
+    chart_dir = args.out.with_name(f"{args.out.stem}-charts")
+    chart_dir.mkdir(parents=True, exist_ok=True)
+    for old in chart_dir.glob("*.svg"):
+        old.unlink()
 
-    sections, overview = [], []
+    sections, overview, comparisons = [], [], {}
     for folder in folders:
         label = str(folder.relative_to(root)) if folder != root else folder.name
-        lines, runs = run_set_section(folder, label, rng)
+        lines, runs, side_values = run_set_section(folder, label, rng, chart_dir)
         sections += lines
         parameters = load(folder / "parameters.json") or {}
         phases = "1, 2, and 3" if any(run.phase3 for run in runs) else "1 and 2" if any(run.phase2 for run in runs) else "1"
@@ -635,7 +737,11 @@ def main():
         cells = " | ".join(f"{c['valid']} / {c['failed']} / {c['invalid']}" for c in counts.values())
         overview.append(f"| {label} | {parameters.get('students')} | {phases} | {cells} | {state} | "
                         f"`{str(parameters.get('toolRevision', ''))[:11]}` | {parameters.get('startedAt')} |")
-
+        if type(parameters.get("students")) is int:
+            key = (tuple(parameters.get("sideA") or []), tuple(parameters.get("sideB") or []))
+            comparisons.setdefault(key, []).append({"label": label, "students": parameters["students"], "state": state,
+                                                    "started": parameters.get("startedAt") or "", "values": side_values})
+    scaling = scaling_section(comparisons, chart_dir)
     host = load(folders[-1] / "host.json") or {}
     header = [
         "# Quiz Module Benchmark: Track B Results",
@@ -653,6 +759,7 @@ def main():
         "|---|---|---|---|---|---|---|---|",
         *overview,
         "",
+        *scaling,
     ]
     args.out.write_text("\n".join(header + sections))
     print(f"wrote {args.out}")
