@@ -293,7 +293,7 @@ expect "no verdict for two runs per side at 100 students" \
 fake_set "$work/s2000" 2000 5
 python3 "$here/report.py" --out "$work/s2000.md" "$work/s2000" >/dev/null
 expect "the H3 pair gives verdicts from a 2000-student result set" \
-    "$(grep '^| H3 ' "$work/s2000.md" | grep -c '| holds |$')" 4
+    "$(grep '^| H3 [^|]' "$work/s2000.md" | grep -c '| holds |$')" 4
 expect "H3 reads the initial reads, 5 overview observations per run" \
     "$(grep -c '^| H3 statistics-overview initial p95 (ms) | [0-9.]* | 5 | < 1000 | holds |' "$work/s2000.md")" 1
 expect "the H3 pair gives no H2 verdict" "$(grep -c '^| H2 .*no verdict (not the H2 pair)' "$work/s2000.md")" 1
