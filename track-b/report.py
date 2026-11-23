@@ -634,8 +634,10 @@ def run_set_section(folder, label, rng, chart_dir):
     if failures:
         value += f" ({failures})"
     submits = [trend(run.phase1, "http_req_duration{type:submit}").get("count") for run in valid["B"]]
-    out.append(f"| H2 submit p95 B/A | {value} | {', '.join(f'{c:.0f}' for c in submits if c) or '–'} | ≤ 1.10 | "
-               f"{result('H2', None if not ratio else ratio[2] <= 1.10, min(len(submit['A']), len(submit['B'])))} |")
+    h2_result = result('H2', None if not ratio else ratio[2] <= 1.10, min(len(submit['A']), len(submit['B'])))
+    # Structured copy of the hypothesis rows for the thesis tables: (hypothesis, check, value, bound, result).
+    hypotheses = [("H2", "Live submit p95, ratio B/A, median [95% interval]", value, "≤ 1.10", h2_result)]
+    out.append(f"| H2 submit p95 B/A | {value} | {', '.join(f'{c:.0f}' for c in submits if c) or '–'} | ≤ 1.10 | {h2_result} |")
     if has_phase2:
         for type_ in PHASE2_TYPES[:3]:
             values = [trend(run.phase2, f"http_req_duration{{type:{type_},read:initial}}").get("p(95)") for run in valid["B"]]
@@ -643,8 +645,10 @@ def run_set_section(folder, label, rng, chart_dir):
             counts = sorted({trend(run.phase2, f"http_req_duration{{type:{type_},read:initial}}").get("count") for run in valid["B"]} - {None})
             high = bootstrap_high(values, rng)
             cell = "no initial reads recorded" if not values else (f"{values[0]:.1f} (one run)" if high is None else f"{high:.1f}")
-            out.append(f"| H3 {type_} initial p95 (ms) | {cell} | {', '.join(f'{c:.0f}' for c in counts) or '–'} | < 1000 | "
-                       f"{result('H3', None if high is None else high < 1000, len(values))} |")
+            h3_result = result('H3', None if high is None else high < 1000, len(values))
+            hypotheses.append(("H3", f"{type_.removeprefix('statistics-').capitalize()} statistics, initial read p95 (ms), upper interval limit",
+                               cell, "< 1000", h3_result))
+            out.append(f"| H3 {type_} initial p95 (ms) | {cell} | {', '.join(f'{c:.0f}' for c in counts) or '–'} | < 1000 | {h3_result} |")
     if has_phase3 or parameters.get("phase3"):
         expected = h3_practice_count(parameters)
         candidate = [run.freshness for run in valid["B"] if run.freshness and finite_number(run.freshness.get("p95Millis"))]
@@ -661,11 +665,155 @@ def run_set_section(folder, label, rng, chart_dir):
                 verdict = f"untested: incomplete {H3_PRACTICE_RATE}/s practice evidence"
             else:
                 verdict = result("H3", None if high is None else (not censored and high < 2000), len(values))
+        hypotheses.append(("H3", "Statistics freshness p95 (ms), upper interval limit", cell, "< 2000", verdict))
         out.append(f"| H3 freshness p95 (ms) | {cell} | {', '.join(str(c) for c in counts) or '–'} | < 2000 | {verdict} |")
     else:
+        hypotheses.append(("H3", "Statistics freshness p95 (ms), upper interval limit", "Phase 3 not run", "< 2000", "untested (D38 rule 6)"))
         out.append("| H3 freshness p95 (ms) | Phase 3 not run | – | < 2000 | untested (D38 rule 6) |")
     out.append("")
-    return out, runs, side_values
+    return out, runs, side_values, hypotheses
+
+
+# Thesis tables: comparison names, the metrics of the table at 2000 students, and the metrics across scales. Keys are
+# metric names of the A/B table; labels are for the thesis.
+COMPARISON_NAMES = {("43bafcee17c", "8325896e0b4"): "End-to-end (H2)", ("c136826e299", "24a062759c2"): "On-demand statistics (H3)"}
+THESIS_METRICS = [
+    ("Phase 1 submit p95 (ms)", "Live submit p95 (ms)"),
+    ("Phase 1 save p95 (ms)", "Live save p95 (ms)"),
+    ("Phase 1 start-participation p95 (ms)", "Start participation p95 (ms)"),
+    ("Evaluation (s)", "Evaluation duration (s)"),
+    ("Time to result p95 (ms)", "Time to result p95 (ms)"),
+    ("Phase 2 statistics-overview initial p95 (ms)", "Statistics overview, initial read p95 (ms)"),
+    ("Phase 2 statistics-points initial p95 (ms)", "Statistics points, initial read p95 (ms)"),
+    ("Phase 2 statistics-question initial p95 (ms)", "Statistics question, initial read p95 (ms)"),
+    ("Phase 3 freshness p95 (ms, lower bound if censored)", "Statistics freshness p95 (ms)"),
+    ("Phase 3 practice-submit p95 (ms)", "Practice submit p95 (ms)"),
+    ("Phase 3 rows written", "Rows written in Phase 3"),
+    ("Control submit p95 (ms)", "Control submit p95 (ms), drift indicator"),
+]
+THESIS_SCALE_METRICS = ["Phase 1 submit p95 (ms)", "Evaluation (s)", "Time to result p95 (ms)",
+                        "Phase 2 statistics-overview initial p95 (ms)", "Phase 3 freshness p95 (ms, lower bound if censored)"]
+THIN = "\u2009"  # thousands separator: a space in Markdown, \, in LaTeX
+
+
+def number(value):
+    """29 098 for large values, 15.4 from 1 on, 0.52 below 1."""
+    if abs(value) >= 1000:
+        return f"{value:,.0f}".replace(",", THIN)
+    return f"{value:.1f}" if abs(value) >= 1 else f"{value:.2f}"
+
+
+def interval_cell(interval):
+    if not interval:
+        return "–"
+    median, low, high = interval
+    return number(median) if low is None else f"{number(median)} [{number(low)}, {number(high)}]"
+
+
+def change_cell(a, b):
+    if not a or not b or not a[0]:
+        return "–"
+    return f"{(b[0] / a[0] - 1) * 100:+.1f}%".replace("-", "−")
+
+
+def tex(text):
+    """Markdown table text as LaTeX: special characters, bold, arrows, comparison signs, and thin spaces."""
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    for old, new in (("\\", r"\textbackslash{}"), ("&", r"\&"), ("%", r"\%"), ("_", r"\_"), ("#", r"\#")):
+        text = text.replace(old, new)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\\textbf{\1}", text)
+    for old, new in (("≤", r"$\leq$"), ("<", r"$<$"), ("→", r"$\rightarrow$"), ("−", r"$-$"), ("–", "--"), (THIN, r"\,")):
+        text = text.replace(old, new)
+    return text
+
+
+def thesis_tables(comparisons):
+    """The combined thesis tables from the result sets only (pilots never enter them): key metrics at 2000 students per
+    comparison, the hypothesis verdicts, and the medians across scales. Returns (Markdown lines, LaTeX text)."""
+    named = {}
+    for (side_a, side_b), entries in comparisons.items():
+        pair = (commit_of(list(side_a)), commit_of(list(side_b)))
+        scales = {}
+        for entry in sorted(entries, key=lambda e: e["started"]):
+            if entry["state"] == "result set":
+                scales[entry["students"]] = entry
+        if scales:
+            named[COMPARISON_NAMES.get(pair, f"{pair[0]} → {pair[1]}")] = (pair, scales)
+    md = ["## Thesis tables", "",
+          "Generated from result sets only (5 valid runs per side, D6); pilots and incomplete sets never enter these tables. "
+          f"The same tables in LaTeX (booktabs): the file `*-thesis.tex` next to this report.", ""]
+    if not named:
+        md += ["No result set yet.", ""]
+        return md, "% Track B thesis tables: no result set yet.\n"
+    revisions = sorted({entry["revision"] for _, scales in named.values() for entry in scales.values()})
+    method = (f"Median of the per-run values over the valid runs, 95% percentile bootstrap interval over runs in brackets "
+              f"(10000 resamples). Change: B against A, from the medians. Local Mac (D36); tool revision "
+              f"{', '.join(r[:11] for r in revisions)}.")
+    groups, verdicts, scaling = [], [], []
+    for name, (pair, scales) in named.items():
+        if VERDICT_STUDENTS in scales:
+            values = scales[VERDICT_STUDENTS]["values"]
+            rows = []
+            for key, label in THESIS_METRICS:
+                sides = values.get(key)
+                if sides and (sides["A"][1] or sides["B"][1]):
+                    rows.append([label, interval_cell(sides["A"][1]), interval_cell(sides["B"][1]), change_cell(sides["A"][1], sides["B"][1])])
+            groups.append((f"{name}: A = {pair[0]}, B = {pair[1]}", rows))
+            for hypothesis, check, value, bound, result in scales[VERDICT_STUDENTS]["hypotheses"]:
+                if not result.startswith("no verdict"):
+                    verdicts.append([hypothesis, name, check, value, bound, result])
+        sizes = sorted(scales)
+        if len(sizes) > 1:
+            rows = []
+            for key in THESIS_SCALE_METRICS:
+                label = dict(THESIS_METRICS)[key]
+                cells = []
+                for students in sizes:
+                    sides = scales[students]["values"].get(key)
+                    a, b = (sides["A"][1], sides["B"][1]) if sides else (None, None)
+                    cells.append(f"{number(a[0])} → {number(b[0])}" if a and b else "–")
+                if any(cell != "–" for cell in cells):
+                    rows.append([label, *cells])
+            scaling.append((f"{name}: A → B", sizes, rows))
+
+    def md_table(header, rows):
+        return ["| " + " | ".join(header) + " |", "|" + "---|" * len(header),
+                *("| " + " | ".join(cell.replace(THIN, " ") for cell in row) + " |" for row in rows), ""]
+
+    def tex_table(caption, label, spec, header, row_groups):
+        lines = [r"\begin{table}[htbp]", r"\centering", r"\small", f"\\caption{{{tex(caption)}}}", f"\\label{{{label}}}",
+                 f"\\begin{{tabular}}{{{spec}}}", r"\toprule", " & ".join(tex(cell) for cell in header) + r" \\", r"\midrule"]
+        for index, (title, rows) in enumerate(row_groups):
+            if title:
+                if index:
+                    lines.append(r"\midrule")
+                lines.append(f"\\multicolumn{{{len(header)}}}{{l}}{{\\textit{{{tex(title)}}}}} \\\\")
+            lines += [" & ".join(tex(cell) for cell in row) + r" \\" for row in rows]
+        return lines + [r"\bottomrule", r"\end{tabular}", r"\end{table}", ""]
+
+    header = ["Metric", "A", "B", "Change"]
+    caption = f"Track B at {VERDICT_STUDENTS} students, both comparisons. {method}"
+    md.append(f"### Table 1: key metrics at {VERDICT_STUDENTS} students")
+    md += ["", method, ""]
+    for title, rows in groups:
+        md += [f"**{title}**", "", *md_table(header, rows)]
+    out = ["% Track B thesis tables, generated by track-b/report.py; do not edit. Needs \\usepackage{booktabs}.", ""]
+    if groups:
+        out += tex_table(caption, "tab:trackb-2000", "lrrr", header, groups)
+    vheader = ["Hypothesis", "Comparison", "Check", "Value", "Bound", "Result"]
+    vcaption = (f"Track B hypothesis checks at {VERDICT_STUDENTS} students (D16, D44, D45). H2: median ratio B/A of the per-run "
+                "submit p95 with its 95% bootstrap interval. H3: upper limit of the 95% bootstrap interval of the per-run p95 on "
+                "side B. The bounds are proposals for the supervisor.")
+    md += ["### Table 2: hypothesis checks", "", vcaption, ""]
+    md += md_table(vheader, verdicts) if verdicts else ["No verdict yet.", ""]
+    if verdicts:
+        out += tex_table(vcaption, "tab:trackb-hypotheses", "lllrll", vheader, [(None, verdicts)])
+    for index, (title, sizes, rows) in enumerate(scaling):
+        sheader = ["Metric", *(f"{s} students" for s in sizes)]
+        scaption = f"Track B across scales, {title} (medians over 5 valid runs per side)."
+        md += [f"### Table {3 + index}: {title} across scales", "", scaption, "", *md_table(sheader, rows)]
+        out += tex_table(scaption, f"tab:trackb-scales-{slug(title.split(':')[0]).lower()}", "l" + "r" * len(sizes), sheader, [(None, rows)])
+    return md, "\n".join(out)
 
 
 def scaling_section(comparisons, chart_dir):
@@ -727,7 +875,7 @@ def main():
     sections, overview, comparisons = [], [], {}
     for folder in folders:
         label = str(folder.relative_to(root)) if folder != root else folder.name
-        lines, runs, side_values = run_set_section(folder, label, rng, chart_dir)
+        lines, runs, side_values, hypotheses = run_set_section(folder, label, rng, chart_dir)
         sections += lines
         parameters = load(folder / "parameters.json") or {}
         phases = "1, 2, and 3" if any(run.phase3 for run in runs) else "1 and 2" if any(run.phase2 for run in runs) else "1"
@@ -740,8 +888,12 @@ def main():
         if type(parameters.get("students")) is int:
             key = (tuple(parameters.get("sideA") or []), tuple(parameters.get("sideB") or []))
             comparisons.setdefault(key, []).append({"label": label, "students": parameters["students"], "state": state,
-                                                    "started": parameters.get("startedAt") or "", "values": side_values})
+                                                    "started": parameters.get("startedAt") or "", "values": side_values,
+                                                    "hypotheses": hypotheses,
+                                                    "revision": str(parameters.get("toolRevision", ""))})
     scaling = scaling_section(comparisons, chart_dir)
+    thesis_md, thesis_tex = thesis_tables(comparisons)
+    args.out.with_name(f"{args.out.stem}-thesis.tex").write_text(thesis_tex)
     host = load(folders[-1] / "host.json") or {}
     header = [
         "# Quiz Module Benchmark: Track B Results",
@@ -759,6 +911,7 @@ def main():
         "|---|---|---|---|---|---|---|---|",
         *overview,
         "",
+        *thesis_md,
         *scaling,
     ]
     args.out.write_text("\n".join(header + sections))
