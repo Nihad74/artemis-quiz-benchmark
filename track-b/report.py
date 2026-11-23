@@ -21,7 +21,8 @@ are given only for a result set of the targeted pair (D37) at 2000 students. Oth
 an illustration, without a verdict. H3 reads statistics directly after the evaluation: the initial reads of Phase 2
 (5 observations of the overview and the points page per run). Charts (SVG, charts.py) go to <out>-charts/ next to the
 report: per run set side A against side B for the key metrics, and per comparison the medians across scales. They use
-the same per-run values and intervals as the tables. Standard library only.
+the same per-run values and intervals as the tables. The combined thesis tables (result sets only) with their charts go
+to <out>-thesis.md and, in LaTeX, to <out>-thesis.tex. Standard library only.
 """
 
 import argparse
@@ -727,9 +728,10 @@ def tex(text):
     return text
 
 
-def thesis_tables(comparisons):
+def thesis_tables(comparisons, chart_dir, scaling_charts):
     """The combined thesis tables from the result sets only (pilots never enter them): key metrics at 2000 students per
-    comparison, the hypothesis verdicts, and the medians across scales. Returns (Markdown lines, LaTeX text)."""
+    comparison with its A/B chart, the hypothesis verdicts, and the medians across scales with their chart. Returns
+    (Markdown lines, LaTeX text)."""
     named = {}
     for (side_a, side_b), entries in comparisons.items():
         pair = (commit_of(list(side_a)), commit_of(list(side_b)))
@@ -739,17 +741,20 @@ def thesis_tables(comparisons):
                 scales[entry["students"]] = entry
         if scales:
             named[COMPARISON_NAMES.get(pair, f"{pair[0]} → {pair[1]}")] = (pair, scales)
-    md = ["## Thesis tables", "",
-          "Generated from result sets only (5 valid runs per side, D6); pilots and incomplete sets never enter these tables. "
-          f"The same tables in LaTeX (booktabs): the file `*-thesis.tex` next to this report.", ""]
+    md = ["Generated from result sets only (5 valid runs per side, D6); pilots and incomplete sets never enter these tables "
+          "or charts. The same tables in LaTeX (booktabs): the file `*-thesis.tex` next to this file.", ""]
     if not named:
         md += ["No result set yet.", ""]
         return md, "% Track B thesis tables: no result set yet.\n"
+
+    def chart(file, alt):
+        return [f"![{alt}]({chart_dir.name}/{file})", ""] if (chart_dir / file).exists() else []
+
     revisions = sorted({entry["revision"] for _, scales in named.values() for entry in scales.values()})
     method = (f"Median of the per-run values over the valid runs, 95% percentile bootstrap interval over runs in brackets "
               f"(10000 resamples). Change: B against A, from the medians. Local Mac (D36); tool revision "
               f"{', '.join(r[:11] for r in revisions)}.")
-    groups, verdicts, scaling = [], [], []
+    groups, charts_2000, verdicts, scaling = [], [], [], []
     for name, (pair, scales) in named.items():
         if VERDICT_STUDENTS in scales:
             values = scales[VERDICT_STUDENTS]["values"]
@@ -759,6 +764,7 @@ def thesis_tables(comparisons):
                 if sides and (sides["A"][1] or sides["B"][1]):
                     rows.append([label, interval_cell(sides["A"][1]), interval_cell(sides["B"][1]), change_cell(sides["A"][1], sides["B"][1])])
             groups.append((f"{name}: A = {pair[0]}, B = {pair[1]}", rows))
+            charts_2000.append(chart(f"{slug(scales[VERDICT_STUDENTS]['label'])}-ab.svg", f"{name} at {VERDICT_STUDENTS} students"))
             for hypothesis, check, value, bound, result in scales[VERDICT_STUDENTS]["hypotheses"]:
                 if not result.startswith("no verdict"):
                     verdicts.append([hypothesis, name, check, value, bound, result])
@@ -774,7 +780,7 @@ def thesis_tables(comparisons):
                     cells.append(f"{number(a[0])} → {number(b[0])}" if a and b else "–")
                 if any(cell != "–" for cell in cells):
                     rows.append([label, *cells])
-            scaling.append((f"{name}: A → B", sizes, rows))
+            scaling.append((f"{name}: A → B", sizes, rows, chart(scaling_charts.get(pair, ""), f"{name} across scales")))
 
     def md_table(header, rows):
         return ["| " + " | ".join(header) + " |", "|" + "---|" * len(header),
@@ -793,10 +799,12 @@ def thesis_tables(comparisons):
 
     header = ["Metric", "A", "B", "Change"]
     caption = f"Track B at {VERDICT_STUDENTS} students, both comparisons. {method}"
-    md.append(f"### Table 1: key metrics at {VERDICT_STUDENTS} students")
-    md += ["", method, ""]
-    for title, rows in groups:
-        md += [f"**{title}**", "", *md_table(header, rows)]
+    md.append(f"## Table 1: key metrics at {VERDICT_STUDENTS} students")
+    md += ["", method, "",
+           "Each chart below shows every valid run as a dot. Read the medians together with it: a median over 5 runs hides "
+           "runs that split into fast and saturated ones.", ""]
+    for (title, rows), figure in zip(groups, charts_2000):
+        md += [f"**{title}**", "", *md_table(header, rows), *figure]
     out = ["% Track B thesis tables, generated by track-b/report.py; do not edit. Needs \\usepackage{booktabs}.", ""]
     if groups:
         out += tex_table(caption, "tab:trackb-2000", "lrrr", header, groups)
@@ -804,22 +812,23 @@ def thesis_tables(comparisons):
     vcaption = (f"Track B hypothesis checks at {VERDICT_STUDENTS} students (D16, D44, D45). H2: median ratio B/A of the per-run "
                 "submit p95 with its 95% bootstrap interval. H3: upper limit of the 95% bootstrap interval of the per-run p95 on "
                 "side B. The bounds are proposals for the supervisor.")
-    md += ["### Table 2: hypothesis checks", "", vcaption, ""]
+    md += ["## Table 2: hypothesis checks", "", vcaption, ""]
     md += md_table(vheader, verdicts) if verdicts else ["No verdict yet.", ""]
     if verdicts:
         out += tex_table(vcaption, "tab:trackb-hypotheses", "lllrll", vheader, [(None, verdicts)])
-    for index, (title, sizes, rows) in enumerate(scaling):
+    for index, (title, sizes, rows, figure) in enumerate(scaling):
         sheader = ["Metric", *(f"{s} students" for s in sizes)]
         scaption = f"Track B across scales, {title} (medians over 5 valid runs per side)."
-        md += [f"### Table {3 + index}: {title} across scales", "", scaption, "", *md_table(sheader, rows)]
+        md += [f"## Table {3 + index}: {title} across scales", "", scaption, "", *md_table(sheader, rows), *figure]
         out += tex_table(scaption, f"tab:trackb-scales-{slug(title.split(':')[0]).lower()}", "l" + "r" * len(sizes), sheader, [(None, rows)])
     return md, "\n".join(out)
 
 
 def scaling_section(comparisons, chart_dir):
     """One chart per comparison measured at two or more scales: the median and interval of each side per scale. At a
-    scale with several run sets, the best state wins (result set, complete pilot, incomplete), then the latest start."""
-    out = []
+    scale with several run sets, the best state wins (result set, complete pilot, incomplete), then the latest start.
+    Returns the report lines and the chart file per commit pair whose scales are all result sets."""
+    out, result_charts = [], {}
     for (side_a, side_b), sets in comparisons.items():
         chosen = {}
         for entry in sorted(sets, key=lambda e: (-STATE_RANK.get(e["state"], 3), e["started"])):
@@ -853,7 +862,9 @@ def scaling_section(comparisons, chart_dir):
                 + "; ".join(f"{s} students: {chosen[s]['label']} ({chosen[s]['state']})" for s in scales)
                 + ". Pilots are for orientation only (D6).", "",
                 f"![Across scales, {sides['A']} against {sides['B']}]({chart_dir.name}/{file.name})", ""]
-    return out
+        if not pilot:
+            result_charts[(sides["A"], sides["B"])] = file.name
+    return out, result_charts
 
 
 def main():
@@ -891,16 +902,24 @@ def main():
                                                     "started": parameters.get("startedAt") or "", "values": side_values,
                                                     "hypotheses": hypotheses,
                                                     "revision": str(parameters.get("toolRevision", ""))})
-    scaling = scaling_section(comparisons, chart_dir)
-    thesis_md, thesis_tex = thesis_tables(comparisons)
+    scaling, scaling_charts = scaling_section(comparisons, chart_dir)
+    thesis_md, thesis_tex = thesis_tables(comparisons, chart_dir, scaling_charts)
+    thesis_out = args.out.with_name(f"{args.out.stem}-thesis.md")
     args.out.with_name(f"{args.out.stem}-thesis.tex").write_text(thesis_tex)
+    generated = (f"Generated by `track-b/report.py` of `github.com/Nihad74/artemis-quiz-benchmark` (revision `{revision}`) on "
+                 f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
+    thesis_out.write_text("\n".join([
+        "# Quiz Module Benchmark: Track B Thesis Tables", "",
+        f"{generated}, together with `{args.out.name}`. Do not edit by hand. Per-run details: `{args.out.name}`.", "",
+        *thesis_md]))
     host = load(folders[-1] / "host.json") or {}
     header = [
         "# Quiz Module Benchmark: Track B Results",
         "",
-        f"Generated by `track-b/report.py` of `github.com/Nihad74/artemis-quiz-benchmark` (revision `{revision}`) on "
-        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC from the run folders below. Do not edit by hand; run the "
+        f"{generated} from the run folders below. Do not edit by hand; run the "
         "script again after new runs. Setup and methods: `quiz-benchmark-track-b-setup.md`; decisions: `quiz-benchmark-decisions.md`.",
+        "",
+        f"Thesis tables and charts (result sets only): `{thesis_out.name}`, in LaTeX `{thesis_out.stem}.tex`.",
         "",
         f"Environment (D36: every run set runs on the local Mac): {host.get('cpuModel', '?')}, {host.get('engine', '?')}, "
         f"{host.get('engineCpus', '?')} CPUs and {(host.get('engineMemory') or 0) / 2**20:.0f} MiB for Docker.",
@@ -911,7 +930,6 @@ def main():
         "|---|---|---|---|---|---|---|---|",
         *overview,
         "",
-        *thesis_md,
         *scaling,
     ]
     args.out.write_text("\n".join(header + sections))
